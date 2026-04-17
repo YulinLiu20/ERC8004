@@ -66,6 +66,11 @@ It keeps only mint events:
 
 Then it filters to the configured agent ID range and keeps the first `TARGET_AGENT_COUNT` agents in ascending `agent_id` order.
 
+Some RPC providers are stricter about `eth_getLogs` requests than others. The script now:
+
+- filters discovery logs to the `Transfer` topic immediately
+- automatically retries with a smaller block window if a provider rejects a larger log query
+
 ### Identity
 
 For each agent in the batch, the script reads:

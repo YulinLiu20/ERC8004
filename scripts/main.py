@@ -204,6 +204,7 @@ def fetch_identity_logs(start_block: int, end_block: int) -> List[dict]:
             "fromBlock": int(start_block),
             "toBlock": int(end_block),
             "address": checksum(IDENTITY_REGISTRY),
+            "topics": [TRANSFER_TOPIC],
         }
     )
 
@@ -211,6 +212,7 @@ def fetch_identity_logs(start_block: int, end_block: int) -> List[dict]:
 def discover_target_agents(config: PipelineConfig) -> List[Dict[str, object]]:
     current_block = config.start_block
     discovered: Dict[int, Dict[str, object]] = {}
+    current_window = config.scan_block_window
 
     print(
         f"[discovery] scanning from block {config.start_block} "
@@ -218,8 +220,20 @@ def discover_target_agents(config: PipelineConfig) -> List[Dict[str, object]]:
     )
 
     while current_block <= config.observation_block:
-        chunk_end = min(current_block + config.scan_block_window - 1, config.observation_block)
-        logs = fetch_identity_logs(current_block, chunk_end)
+        chunk_end = min(current_block + current_window - 1, config.observation_block)
+
+        try:
+            logs = fetch_identity_logs(current_block, chunk_end)
+        except Exception as exc:
+            if current_window > 1:
+                next_window = max(1, current_window // 2)
+                print(
+                    f"[discovery] get_logs failed for blocks {current_block}-{chunk_end}: {repr(exc)}. "
+                    f"Retrying with smaller window {next_window}."
+                )
+                current_window = next_window
+                continue
+            raise
 
         for log in logs:
             topics = log.get("topics", [])
@@ -243,12 +257,14 @@ def discover_target_agents(config: PipelineConfig) -> List[Dict[str, object]]:
 
         print(
             f"[discovery] blocks {current_block}-{chunk_end} "
-            f"discovered={len(discovered)}"
+            f"discovered={len(discovered)} window={current_window}"
         )
 
         if len(discovered) >= config.target_agent_count:
             break
 
+        if current_window < config.scan_block_window:
+            current_window = min(config.scan_block_window, current_window * 2)
         current_block = chunk_end + 1
 
     ordered = [discovered[agent_id] for agent_id in sorted(discovered)]
