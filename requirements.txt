@@ -1,0 +1,5 @@
+web3
+psycopg2-binary
+pandas
+requests
+python-dateutil
