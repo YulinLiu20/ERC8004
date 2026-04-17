@@ -38,18 +38,20 @@ CONTRACT_SYMBOL = "AGENT"
 START_BLOCK = 24339925
 OBSERVATION_BLOCK = START_BLOCK + 500000
 
-TARGET_AGENT_ID_MIN = 0
-TARGET_AGENT_ID_MAX = 999
+TARGET_AGENT_ID_MIN = 1000
+TARGET_AGENT_ID_MAX = 1999
 TARGET_AGENT_COUNT = 1000
 
 SCAN_BLOCK_WINDOW = 500
-PIPELINE_BATCH_SIZE = 100
-MAX_WORKERS = 8
+PIPELINE_BATCH_SIZE = 50
+MAX_WORKERS = 4
 HTTP_TIMEOUT = 20
 RPC_MAX_RETRIES = 6
 RPC_RETRY_BASE_DELAY_SECONDS = 0.5
 RPC_BACKOFF_JITTER_SECONDS = 0.25
 FAIL_ON_INCOMPLETE_SNAPSHOT = True
+SECOND_PASS_RETRY_ENABLED = True
+SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,8 @@ class PipelineConfig:
     rpc_retry_base_delay_seconds: float = RPC_RETRY_BASE_DELAY_SECONDS
     rpc_backoff_jitter_seconds: float = RPC_BACKOFF_JITTER_SECONDS
     fail_on_incomplete_snapshot: bool = FAIL_ON_INCOMPLETE_SNAPSHOT
+    second_pass_retry_enabled: bool = SECOND_PASS_RETRY_ENABLED
+    second_pass_retry_delay_seconds: float = SECOND_PASS_RETRY_DELAY_SECONDS
 
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
@@ -509,6 +513,7 @@ def run_identity_stage(
     successes: List[Dict[str, object]] = []
     failed = 0
     skipped = 0
+    failed_seeds: List[Dict[str, object]] = []
 
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         future_map = {
@@ -526,6 +531,30 @@ def run_identity_stage(
             except Exception as exc:
                 print(f"[identity] failed agent_id={agent_id}: {repr(exc)}")
                 failed += 1
+                failed_seeds.append(seed)
+
+    if config.second_pass_retry_enabled and failed_seeds:
+        print(f"[identity] second-pass retry for {len(failed_seeds)} failed agents (serial mode)")
+        recovered: List[Dict[str, object]] = []
+        still_failed: List[Dict[str, object]] = []
+
+        for seed in failed_seeds:
+            agent_id = int(seed["agent_id"])
+            try:
+                time.sleep(config.second_pass_retry_delay_seconds)
+                record = fetch_identity_state(seed, config.observation_block, config)
+                recovered.append(record)
+            except Exception as exc:
+                print(f"[identity] second-pass failed agent_id={agent_id}: {repr(exc)}")
+                still_failed.append(seed)
+
+        if recovered:
+            successes.extend(recovered)
+            failed -= len(recovered)
+            print(
+                f"[identity] second-pass recovered={len(recovered)} "
+                f"remaining_failed={len(still_failed)}"
+            )
 
     if successes:
         upsert_agents_core(successes)
@@ -899,6 +928,7 @@ def run_reputation_stage(
     failed = 0
     skipped = 0
     failed_agent_ids: List[int] = []
+    failed_identity_records: List[Dict[str, object]] = []
 
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         future_map = {
@@ -918,6 +948,34 @@ def run_reputation_stage(
                 print(f"[reputation] failed agent_id={agent_id}: {repr(exc)}")
                 failed += 1
                 failed_agent_ids.append(agent_id)
+                failed_identity_records.append(identity_record)
+
+    if config.second_pass_retry_enabled and failed_identity_records:
+        print(
+            f"[reputation] second-pass retry for {len(failed_identity_records)} "
+            "failed agents (serial mode)"
+        )
+        recovered_agent_ids: List[int] = []
+
+        for identity_record in failed_identity_records:
+            agent_id = int(identity_record["agent_id"])
+            try:
+                time.sleep(config.second_pass_retry_delay_seconds)
+                result = fetch_reputation(identity_record, config.observation_block, config)
+                write_reputation_record(result["summary"], result["feedback_rows"])
+                successful_records[agent_id] = result
+                recovered_agent_ids.append(agent_id)
+            except Exception as exc:
+                print(f"[reputation] second-pass failed agent_id={agent_id}: {repr(exc)}")
+
+        if recovered_agent_ids:
+            recovered_set = set(recovered_agent_ids)
+            failed_agent_ids = [agent_id for agent_id in failed_agent_ids if agent_id not in recovered_set]
+            failed = len(failed_agent_ids)
+            print(
+                f"[reputation] second-pass recovered={len(recovered_set)} "
+                f"remaining_failed={failed}"
+            )
 
     stats = {
         "success": len(successful_records),
