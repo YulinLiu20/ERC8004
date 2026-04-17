@@ -1,18 +1,19 @@
-import os
 import json
-import time
-import argparse
-import requests
-import psycopg2
-from psycopg2.extras import execute_batch
-from datetime import datetime, timezone
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import psycopg2
+import requests
+from psycopg2.extras import execute_batch
 from web3 import Web3
+
 
 # =========================================================
 # User Configuration
-# Only NEON_DATABASE_URL is secret.
-# Everything else can remain visible in the repo.
+# Edit these values in code before running the workflow.
 # =========================================================
 
 RPC_URL = "https://ethereum-rpc.publicnode.com"
@@ -27,52 +28,89 @@ REPUTATION_REGISTRY = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
 CONTRACT_NAME = "AgentIdentity"
 CONTRACT_SYMBOL = "AGENT"
 
+START_BLOCK = 24339925
+OBSERVATION_BLOCK = START_BLOCK + 500000
+
+TARGET_AGENT_ID_MIN = 0
+TARGET_AGENT_ID_MAX = 999
+TARGET_AGENT_COUNT = 1000
+
 SCAN_BLOCK_WINDOW = 500
-AGENT_BATCH_SIZE = 100
-MAX_WORKERS = 10
+PIPELINE_BATCH_SIZE = 100
+MAX_WORKERS = 8
 HTTP_TIMEOUT = 20
 
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    start_block: int = START_BLOCK
+    observation_block: int = OBSERVATION_BLOCK
+    target_agent_id_min: int = TARGET_AGENT_ID_MIN
+    target_agent_id_max: int = TARGET_AGENT_ID_MAX
+    target_agent_count: int = TARGET_AGENT_COUNT
+    scan_block_window: int = SCAN_BLOCK_WINDOW
+    pipeline_batch_size: int = PIPELINE_BATCH_SIZE
+    max_workers: int = MAX_WORKERS
+    http_timeout: int = HTTP_TIMEOUT
+
+
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
-http = requests.Session()
+
 
 # =========================================================
 # Helper Functions
 # =========================================================
 
-def norm_addr(addr):
+TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)")
+ZERO_TOPIC_BYTES32 = b"\x00" * 32
+
+
+def norm_addr(addr: Optional[str]) -> Optional[str]:
     return str(addr).lower() if addr else None
 
-def norm_tx_hash(txh):
+
+def norm_tx_hash(txh: Optional[str]) -> Optional[str]:
     return str(txh).lower() if txh else None
 
-def checksum(addr):
+
+def checksum(addr: str) -> str:
     return Web3.to_checksum_address(addr)
 
-def parse_unix_ts(ts):
+
+def parse_unix_ts(ts: Optional[object]) -> Optional[datetime]:
     if ts is None:
         return None
     return datetime.fromtimestamp(int(ts), tz=timezone.utc)
 
-def detect_hosting_type(token_uri):
+
+def detect_hosting_type(token_uri: Optional[str]) -> Optional[str]:
     if not token_uri:
         return None
-    s = token_uri.lower()
-    if s.startswith("ipfs://"):
+    value = token_uri.lower()
+    if value.startswith("ipfs://"):
         return "ipfs"
-    if s.startswith("http://") or s.startswith("https://"):
+    if value.startswith("http://") or value.startswith("https://"):
         return "https"
     return "other"
 
-def resolve_token_uri(token_uri):
+
+def resolve_token_uri(token_uri: Optional[str]) -> Optional[str]:
     if not token_uri:
         return None
     if token_uri.startswith("ipfs://"):
-        cid = token_uri.replace("ipfs://", "")
+        cid = token_uri.replace("ipfs://", "", 1)
         return f"https://ipfs.io/ipfs/{cid}"
     return token_uri
 
+
 def get_db_conn():
     return psycopg2.connect(NEON_DATABASE_URL)
+
+
+def chunked(items: Sequence[object], size: int) -> Iterable[List[object]]:
+    for index in range(0, len(items), size):
+        yield list(items[index:index + size])
+
 
 # =========================================================
 # ABI Definitions
@@ -95,201 +133,244 @@ IDENTITY_ABI = [
     },
 ]
 
-REPUTATION_ABI_FULL = [
+REPUTATION_ABI = [
     {
-        "inputs":[{"internalType":"uint256","name":"agentId","type":"uint256"}],
-        "name":"getClients",
-        "outputs":[{"internalType":"address[]","name":"","type":"address[]"}],
-        "stateMutability":"view",
-        "type":"function"
+        "inputs": [{"internalType": "uint256", "name": "agentId", "type": "uint256"}],
+        "name": "getClients",
+        "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function",
     },
     {
-        "inputs":[
-            {"internalType":"uint256","name":"agentId","type":"uint256"},
-            {"internalType":"address","name":"clientAddress","type":"address"}
+        "inputs": [
+            {"internalType": "uint256", "name": "agentId", "type": "uint256"},
+            {"internalType": "address", "name": "clientAddress", "type": "address"},
         ],
-        "name":"getLastIndex",
-        "outputs":[{"internalType":"uint64","name":"","type":"uint64"}],
-        "stateMutability":"view",
-        "type":"function"
+        "name": "getLastIndex",
+        "outputs": [{"internalType": "uint64", "name": "", "type": "uint64"}],
+        "stateMutability": "view",
+        "type": "function",
     },
     {
-        "inputs":[
-            {"internalType":"uint256","name":"agentId","type":"uint256"},
-            {"internalType":"address","name":"clientAddress","type":"address"},
-            {"internalType":"uint64","name":"feedbackIndex","type":"uint64"}
+        "inputs": [
+            {"internalType": "uint256", "name": "agentId", "type": "uint256"},
+            {"internalType": "address", "name": "clientAddress", "type": "address"},
+            {"internalType": "uint64", "name": "feedbackIndex", "type": "uint64"},
         ],
-        "name":"readFeedback",
-        "outputs":[
-            {"internalType":"int128","name":"value","type":"int128"},
-            {"internalType":"uint8","name":"valueDecimals","type":"uint8"},
-            {"internalType":"string","name":"tag1","type":"string"},
-            {"internalType":"string","name":"tag2","type":"string"},
-            {"internalType":"bool","name":"isRevoked","type":"bool"}
+        "name": "readFeedback",
+        "outputs": [
+            {"internalType": "int128", "name": "value", "type": "int128"},
+            {"internalType": "uint8", "name": "valueDecimals", "type": "uint8"},
+            {"internalType": "string", "name": "tag1", "type": "string"},
+            {"internalType": "string", "name": "tag2", "type": "string"},
+            {"internalType": "bool", "name": "isRevoked", "type": "bool"},
         ],
-        "stateMutability":"view",
-        "type":"function"
+        "stateMutability": "view",
+        "type": "function",
     },
     {
-        "inputs":[
-            {"internalType":"uint256","name":"agentId","type":"uint256"},
-            {"internalType":"address[]","name":"clientAddresses","type":"address[]"},
-            {"internalType":"string","name":"tag1","type":"string"},
-            {"internalType":"string","name":"tag2","type":"string"}
+        "inputs": [
+            {"internalType": "uint256", "name": "agentId", "type": "uint256"},
+            {"internalType": "address[]", "name": "clientAddresses", "type": "address[]"},
+            {"internalType": "string", "name": "tag1", "type": "string"},
+            {"internalType": "string", "name": "tag2", "type": "string"},
         ],
-        "name":"getSummary",
-        "outputs":[
-            {"internalType":"uint64","name":"count","type":"uint64"},
-            {"internalType":"int128","name":"summaryValue","type":"int128"},
-            {"internalType":"uint8","name":"summaryValueDecimals","type":"uint8"}
+        "name": "getSummary",
+        "outputs": [
+            {"internalType": "uint64", "name": "count", "type": "uint64"},
+            {"internalType": "int128", "name": "summaryValue", "type": "int128"},
+            {"internalType": "uint8", "name": "summaryValueDecimals", "type": "uint8"},
         ],
-        "stateMutability":"view",
-        "type":"function"
-    }
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
-identity_contract = w3.eth.contract(
-    address=checksum(IDENTITY_REGISTRY),
-    abi=IDENTITY_ABI
-)
+identity_contract = w3.eth.contract(address=checksum(IDENTITY_REGISTRY), abi=IDENTITY_ABI)
+rep_contract = w3.eth.contract(address=checksum(REPUTATION_REGISTRY), abi=REPUTATION_ABI)
 
-rep_contract = w3.eth.contract(
-    address=checksum(REPUTATION_REGISTRY),
-    abi=REPUTATION_ABI_FULL
-)
 
 # =========================================================
-# Stage A — Fast Mint Discovery
+# Discovery
 # =========================================================
 
-TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)")
-ZERO_TOPIC_BYTES32 = b"\x00" * 32
-
-def fetch_logs(start_block, end_block):
-    return w3.eth.get_logs({
-        "fromBlock": int(start_block),
-        "toBlock": int(end_block),
-        "address": checksum(IDENTITY_REGISTRY),
-    })
-
-def extract_mint_candidates(logs):
-    candidates = []
-    for log in logs:
-        topics = log["topics"]
-        if len(topics) == 4 and topics[0] == TRANSFER_TOPIC:
-            if bytes(topics[1]) == ZERO_TOPIC_BYTES32:
-                agent_id = int.from_bytes(bytes(topics[3]), byteorder="big")
-                owner_wallet = norm_addr("0x" + bytes(topics[2])[-20:].hex())
-                candidates.append({
-                    "agent_id": agent_id,
-                    "owner_wallet": owner_wallet,
-                    "mint_tx_hash": norm_tx_hash(log["transactionHash"].hex()),
-                    "mint_block": int(log["blockNumber"]),
-                })
-    return candidates
-
-def validate_one_agent(cand):
-    try:
-        agent_id = cand["agent_id"]
-        owner = norm_addr(identity_contract.functions.ownerOf(agent_id).call())
-        token_uri = identity_contract.functions.tokenURI(agent_id).call()
-        block = w3.eth.get_block(cand["mint_block"])
-
-        return {
-            "agent_id": agent_id,
-            "mint_block": cand["mint_block"],
-            "mint_timestamp": datetime.fromtimestamp(block["timestamp"], tz=timezone.utc),
-            "mint_tx_hash": cand["mint_tx_hash"],
-            "owner_wallet": owner,
-            "agent_wallet": None,
-            "token_uri": token_uri,
-            "metadata_hosting_type": detect_hosting_type(token_uri),
-            "lifecycle_status": "metadata_linked" if token_uri else "minted_only",
-            "observation_block": cand["mint_block"],
-            "observation_timestamp": datetime.now(timezone.utc),
+def fetch_identity_logs(start_block: int, end_block: int) -> List[dict]:
+    return w3.eth.get_logs(
+        {
+            "fromBlock": int(start_block),
+            "toBlock": int(end_block),
+            "address": checksum(IDENTITY_REGISTRY),
         }
-    except Exception as e:
-        print(f"validate_one_agent failed for agent {cand.get('agent_id')}: {repr(e)}")
-        return None
+    )
 
-def parallel_validate_agents(candidates):
-    validated = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(validate_one_agent, c) for c in candidates]
+def discover_target_agents(config: PipelineConfig) -> List[Dict[str, object]]:
+    current_block = config.start_block
+    discovered: Dict[int, Dict[str, object]] = {}
 
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                validated.append(result)
+    print(
+        f"[discovery] scanning from block {config.start_block} "
+        f"to observation_block {config.observation_block}"
+    )
 
-    return validated
+    while current_block <= config.observation_block:
+        chunk_end = min(current_block + config.scan_block_window - 1, config.observation_block)
+        logs = fetch_identity_logs(current_block, chunk_end)
 
-def upsert_agents_core(validated_agents):
-    if not validated_agents:
+        for log in logs:
+            topics = log.get("topics", [])
+            if len(topics) != 4 or topics[0] != TRANSFER_TOPIC:
+                continue
+            if bytes(topics[1]) != ZERO_TOPIC_BYTES32:
+                continue
+
+            agent_id = int.from_bytes(bytes(topics[3]), byteorder="big")
+            if agent_id < config.target_agent_id_min or agent_id > config.target_agent_id_max:
+                continue
+
+            if agent_id in discovered:
+                continue
+
+            discovered[agent_id] = {
+                "agent_id": agent_id,
+                "mint_block": int(log["blockNumber"]),
+                "mint_tx_hash": norm_tx_hash(log["transactionHash"].hex()),
+            }
+
+        print(
+            f"[discovery] blocks {current_block}-{chunk_end} "
+            f"discovered={len(discovered)}"
+        )
+
+        if len(discovered) >= config.target_agent_count:
+            break
+
+        current_block = chunk_end + 1
+
+    ordered = [discovered[agent_id] for agent_id in sorted(discovered)]
+    trimmed = ordered[:config.target_agent_count]
+
+    print(
+        f"[discovery] selected {len(trimmed)} agents "
+        f"for id range {config.target_agent_id_min}-{config.target_agent_id_max}"
+    )
+    return trimmed
+
+
+# =========================================================
+# Identity
+# =========================================================
+
+def fetch_identity_state(agent_seed: Dict[str, object], observation_block: int) -> Dict[str, object]:
+    agent_id = int(agent_seed["agent_id"])
+    mint_block = int(agent_seed["mint_block"])
+    mint_tx_hash = norm_tx_hash(agent_seed["mint_tx_hash"])
+
+    owner = norm_addr(
+        identity_contract.functions.ownerOf(agent_id).call(block_identifier=observation_block)
+    )
+    token_uri = identity_contract.functions.tokenURI(agent_id).call(
+        block_identifier=observation_block
+    )
+    mint_block_data = w3.eth.get_block(mint_block)
+
+    return {
+        "agent_id": agent_id,
+        "mint_block": mint_block,
+        "mint_timestamp": datetime.fromtimestamp(mint_block_data["timestamp"], tz=timezone.utc),
+        "mint_tx_hash": mint_tx_hash,
+        "owner_wallet": owner,
+        "agent_wallet": None,
+        "token_uri": token_uri,
+        "metadata_hosting_type": detect_hosting_type(token_uri),
+        "lifecycle_status": "metadata_linked" if token_uri else "minted_only",
+        "observation_block": observation_block,
+        "observation_timestamp": datetime.now(timezone.utc),
+    }
+
+
+def upsert_agents_core(records: Sequence[Dict[str, object]]) -> None:
+    if not records:
         return
 
     rows = [
         (
-            a["agent_id"],
-            a["mint_block"],
-            a["mint_timestamp"],
-            a["mint_tx_hash"],
-            a["owner_wallet"],
-            a["agent_wallet"],
-            a["token_uri"],
-            a["metadata_hosting_type"],
-            a["lifecycle_status"],
-            a["observation_block"],
-            a["observation_timestamp"],
+            record["agent_id"],
+            record["mint_block"],
+            record["mint_timestamp"],
+            record["mint_tx_hash"],
+            record["owner_wallet"],
+            record["agent_wallet"],
+            record["token_uri"],
+            record["metadata_hosting_type"],
+            record["lifecycle_status"],
+            record["observation_block"],
+            record["observation_timestamp"],
         )
-        for a in validated_agents
+        for record in records
     ]
 
-    conn = get_db_conn()
-    cur = conn.cursor()
-
-    try:
-        execute_batch(cur, """
-            INSERT INTO agents_core (
-                agent_id, mint_block, mint_timestamp, mint_tx_hash,
-                owner_wallet, agent_wallet, token_uri,
-                metadata_hosting_type, lifecycle_status,
-                observation_block, observation_timestamp
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            execute_batch(
+                cur,
+                """
+                INSERT INTO agents_core (
+                    agent_id,
+                    mint_block,
+                    mint_timestamp,
+                    mint_tx_hash,
+                    owner_wallet,
+                    agent_wallet,
+                    token_uri,
+                    metadata_hosting_type,
+                    lifecycle_status,
+                    observation_block,
+                    observation_timestamp
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (agent_id) DO UPDATE SET
+                    mint_block = EXCLUDED.mint_block,
+                    mint_timestamp = EXCLUDED.mint_timestamp,
+                    mint_tx_hash = EXCLUDED.mint_tx_hash,
+                    owner_wallet = EXCLUDED.owner_wallet,
+                    agent_wallet = EXCLUDED.agent_wallet,
+                    token_uri = EXCLUDED.token_uri,
+                    metadata_hosting_type = EXCLUDED.metadata_hosting_type,
+                    lifecycle_status = EXCLUDED.lifecycle_status,
+                    observation_block = EXCLUDED.observation_block,
+                    observation_timestamp = EXCLUDED.observation_timestamp
+                """,
+                rows,
+                page_size=500,
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (agent_id) DO NOTHING
-        """, rows, page_size=500)
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
 
-def upsert_mint_economics(validated_agents):
-    if not validated_agents:
-        print("mint_economics inserted: 0")
+
+def upsert_mint_economics(records: Sequence[Dict[str, object]]) -> None:
+    if not records:
         return
 
-    unique_txs = {}
-
-    for a in validated_agents:
-        txh = norm_tx_hash(a["mint_tx_hash"])
-        if txh not in unique_txs:
-            unique_txs[txh] = int(a["mint_block"])
+    unique_txs: Dict[str, int] = {}
+    for record in records:
+        tx_hash = norm_tx_hash(record["mint_tx_hash"])
+        if tx_hash and tx_hash not in unique_txs:
+            unique_txs[tx_hash] = int(record["mint_block"])
 
     rows = []
-
     for tx_hash, mint_block in unique_txs.items():
-        try:
-            tx = w3.eth.get_transaction(tx_hash)
-            receipt = w3.eth.get_transaction_receipt(tx_hash)
-            block = w3.eth.get_block(mint_block)
+        tx = w3.eth.get_transaction(tx_hash)
+        receipt = w3.eth.get_transaction_receipt(tx_hash)
+        block = w3.eth.get_block(mint_block)
 
-            gas_used = int(receipt["gasUsed"])
-            gas_price_wei = int(tx["gasPrice"])
-            mint_cost_eth = gas_used * gas_price_wei / 1e18
+        gas_used = int(receipt["gasUsed"])
+        gas_price_value = tx.get("gasPrice")
+        if gas_price_value is None:
+            gas_price_value = receipt.get("effectiveGasPrice")
+        gas_price_wei = int(gas_price_value)
+        mint_cost_eth = gas_used * gas_price_wei / 1e18
 
-            rows.append((
+        rows.append(
+            (
                 tx_hash,
                 gas_used,
                 gas_price_wei,
@@ -298,103 +379,86 @@ def upsert_mint_economics(validated_agents):
                 int(tx["nonce"]),
                 int(block["gasLimit"]),
                 int(block["gasUsed"]),
-            ))
-
-        except Exception as e:
-            print(f"Skip mint tx {tx_hash}: {repr(e)}")
+            )
+        )
 
     if not rows:
-        print("mint_economics inserted: 0")
         return
 
-    conn = get_db_conn()
-    cur = conn.cursor()
-
-    try:
-        execute_batch(cur, """
-            INSERT INTO mint_economics (
-                mint_tx_hash,
-                gas_used,
-                gas_price_wei,
-                mint_cost_eth,
-                tx_value_wei,
-                nonce,
-                block_gas_limit,
-                block_gas_used
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            execute_batch(
+                cur,
+                """
+                INSERT INTO mint_economics (
+                    mint_tx_hash,
+                    gas_used,
+                    gas_price_wei,
+                    mint_cost_eth,
+                    tx_value_wei,
+                    nonce,
+                    block_gas_limit,
+                    block_gas_used
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (mint_tx_hash) DO UPDATE SET
+                    gas_used = EXCLUDED.gas_used,
+                    gas_price_wei = EXCLUDED.gas_price_wei,
+                    mint_cost_eth = EXCLUDED.mint_cost_eth,
+                    tx_value_wei = EXCLUDED.tx_value_wei,
+                    nonce = EXCLUDED.nonce,
+                    block_gas_limit = EXCLUDED.block_gas_limit,
+                    block_gas_used = EXCLUDED.block_gas_used
+                """,
+                rows,
+                page_size=500,
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (mint_tx_hash) DO UPDATE SET
-                gas_used = EXCLUDED.gas_used,
-                gas_price_wei = EXCLUDED.gas_price_wei,
-                mint_cost_eth = EXCLUDED.mint_cost_eth,
-                tx_value_wei = EXCLUDED.tx_value_wei,
-                nonce = EXCLUDED.nonce,
-                block_gas_limit = EXCLUDED.block_gas_limit,
-                block_gas_used = EXCLUDED.block_gas_used
-        """, rows, page_size=500)
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
 
-    print(f"mint_economics inserted: {len(rows)}")
 
-def run_stage_a(start_block, end_block):
-    current = start_block
-    mint_buffer = []
+def run_identity_stage(
+    agent_seeds: Sequence[Dict[str, object]], config: PipelineConfig
+) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
+    successes: List[Dict[str, object]] = []
+    failed = 0
+    skipped = 0
 
-    while current <= end_block:
-        chunk_end = min(current + SCAN_BLOCK_WINDOW - 1, end_block)
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        future_map = {
+            executor.submit(fetch_identity_state, seed, config.observation_block): seed
+            for seed in agent_seeds
+        }
 
-        print(f"Scanning blocks {current} -> {chunk_end}")
+        for future in as_completed(future_map):
+            seed = future_map[future]
+            agent_id = int(seed["agent_id"])
 
-        logs = fetch_logs(current, chunk_end)
-        candidates = extract_mint_candidates(logs)
-        mint_buffer.extend(candidates)
+            try:
+                record = future.result()
+                successes.append(record)
+            except Exception as exc:
+                print(f"[identity] failed agent_id={agent_id}: {repr(exc)}")
+                failed += 1
 
-        while len(mint_buffer) >= AGENT_BATCH_SIZE:
-            batch = mint_buffer[:AGENT_BATCH_SIZE]
-            mint_buffer = mint_buffer[AGENT_BATCH_SIZE:]
+    if successes:
+        upsert_agents_core(successes)
+        upsert_mint_economics(successes)
 
-            validated = parallel_validate_agents(batch)
-            upsert_agents_core(validated)
-            upsert_mint_economics(validated)
+    stats = {
+        "success": len(successes),
+        "failed": failed,
+        "skipped": skipped,
+    }
+    return successes, stats
 
-            print(f"Inserted batch: {len(validated)} agents")
-
-        current = chunk_end + 1
-
-    if mint_buffer:
-        validated = parallel_validate_agents(mint_buffer)
-        upsert_agents_core(validated)
-        upsert_mint_economics(validated)
-        print(f"Inserted final batch: {len(validated)} agents")
 
 # =========================================================
-# Stage B — Metadata Enrichment
+# Metadata
 # =========================================================
 
-def load_agents_for_metadata(batch_size=500):
-    conn = get_db_conn()
-    cur = conn.cursor()
+def parse_registration_entry(agent_registry_str: Optional[str]) -> Optional[Dict[str, object]]:
+    if not agent_registry_str:
+        return None
 
-    try:
-        cur.execute("""
-            SELECT agent_id, token_uri
-            FROM agents_core
-            WHERE agent_id NOT IN (
-                SELECT agent_id FROM agent_metadata
-            )
-            ORDER BY agent_id
-            LIMIT %s
-        """, (batch_size,))
-        rows = cur.fetchall()
-        return rows
-    finally:
-        cur.close()
-        conn.close()
-
-def parse_registration_entry(agent_registry_str):
     try:
         parts = agent_registry_str.split(":")
         if len(parts) < 3:
@@ -408,7 +472,9 @@ def parse_registration_entry(agent_registry_str):
     except Exception:
         return None
 
-def process_one_metadata(agent_id, token_uri):
+
+def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -> Optional[Dict[str, object]]:
+    token_uri = identity_record.get("token_uri")
     if not token_uri:
         return None
 
@@ -416,116 +482,119 @@ def process_one_metadata(agent_id, token_uri):
     if not resolved_url:
         return None
 
-    try:
-        resp = http.get(resolved_url, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            return None
+    response = requests.get(resolved_url, timeout=config.http_timeout)
+    response.raise_for_status()
+    metadata = response.json()
 
-        meta = resp.json()
+    services = metadata.get("services", [])
+    supported_trust = metadata.get("supportedTrust", [])
+    registrations = metadata.get("registrations", [])
 
-        services = meta.get("services", [])
-        supported_trust = meta.get("supportedTrust", [])
-        registrations = meta.get("registrations", [])
+    return {
+        "agent_id": identity_record["agent_id"],
+        "resolved_url": resolved_url,
+        "content_type": response.headers.get("Content-Type", ""),
+        "metadata_updated_at": parse_unix_ts(metadata.get("updatedAt")),
+        "name": metadata.get("name"),
+        "description": metadata.get("description"),
+        "image_url": metadata.get("image"),
+        "x402_support": metadata.get("x402support"),
+        "active": metadata.get("active"),
+        "service_count": len(services),
+        "trust_count": len(supported_trust),
+        "registration_count": len(registrations),
+        "services": services,
+        "registrations": registrations,
+    }
 
-        return {
-            "agent_id": agent_id,
-            "resolved_url": resolved_url,
-            "content_type": resp.headers.get("Content-Type", ""),
-            "metadata_updated_at": parse_unix_ts(meta.get("updatedAt")),
-            "name": meta.get("name"),
-            "description": meta.get("description"),
-            "image_url": meta.get("image"),
-            "x402_support": meta.get("x402support"),
-            "active": meta.get("active"),
-            "service_count": len(services),
-            "trust_count": len(supported_trust),
-            "registration_count": len(registrations),
-            "services": services,
-            "registrations": registrations,
-        }
 
-    except Exception as e:
-        print(f"process_one_metadata failed for agent {agent_id}: {repr(e)}")
-        return None
-
-def write_metadata_record(record):
-    conn = get_db_conn()
-    cur = conn.cursor()
-
-    agent_id = record["agent_id"]
-
-    try:
-        cur.execute("""
-            INSERT INTO agent_metadata (
-                agent_id,
-                metadata_url_resolved,
-                metadata_content_type,
-                metadata_updated_at,
-                name,
-                description,
-                image_url,
-                x402_support,
-                active,
-                service_count,
-                trust_count,
-                registration_count
-            )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (agent_id) DO UPDATE SET
-                metadata_url_resolved = EXCLUDED.metadata_url_resolved,
-                metadata_content_type = EXCLUDED.metadata_content_type,
-                metadata_updated_at = EXCLUDED.metadata_updated_at,
-                name = EXCLUDED.name,
-                description = EXCLUDED.description,
-                image_url = EXCLUDED.image_url,
-                x402_support = EXCLUDED.x402_support,
-                active = EXCLUDED.active,
-                service_count = EXCLUDED.service_count,
-                trust_count = EXCLUDED.trust_count,
-                registration_count = EXCLUDED.registration_count
-        """, (
-            agent_id,
-            record["resolved_url"],
-            record["content_type"],
-            record["metadata_updated_at"],
-            record["name"],
-            record["description"],
-            record["image_url"],
-            record["x402_support"],
-            record["active"],
-            record["service_count"],
-            record["trust_count"],
-            record["registration_count"],
-        ))
-
-        cur.execute("DELETE FROM agent_services WHERE agent_id=%s", (agent_id,))
-        for idx, svc in enumerate(record["services"], start=1):
-            cur.execute("""
-                INSERT INTO agent_services (
+def write_metadata_record(record: Dict[str, object], _observation_block: int) -> None:
+    # token_uri is read at observation_block, but the fetched JSON content may be
+    # newer when the URI points to mutable HTTPS-hosted metadata.
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_metadata (
                     agent_id,
-                    service_order,
-                    service_name,
-                    endpoint,
-                    version,
-                    skills_json,
-                    domains_json
+                    metadata_url_resolved,
+                    metadata_content_type,
+                    metadata_updated_at,
+                    name,
+                    description,
+                    image_url,
+                    x402_support,
+                    active,
+                    service_count,
+                    trust_count,
+                    registration_count
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                agent_id,
-                idx,
-                svc.get("name"),
-                svc.get("endpoint"),
-                svc.get("version"),
-                json.dumps(svc.get("skills") or svc.get("a2aSkills")),
-                json.dumps(svc.get("domains")),
-            ))
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (agent_id) DO UPDATE SET
+                    metadata_url_resolved = EXCLUDED.metadata_url_resolved,
+                    metadata_content_type = EXCLUDED.metadata_content_type,
+                    metadata_updated_at = EXCLUDED.metadata_updated_at,
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    image_url = EXCLUDED.image_url,
+                    x402_support = EXCLUDED.x402_support,
+                    active = EXCLUDED.active,
+                    service_count = EXCLUDED.service_count,
+                    trust_count = EXCLUDED.trust_count,
+                    registration_count = EXCLUDED.registration_count
+                """,
+                (
+                    record["agent_id"],
+                    record["resolved_url"],
+                    record["content_type"],
+                    record["metadata_updated_at"],
+                    record["name"],
+                    record["description"],
+                    record["image_url"],
+                    record["x402_support"],
+                    record["active"],
+                    record["service_count"],
+                    record["trust_count"],
+                    record["registration_count"],
+                ),
+            )
 
-        cur.execute("DELETE FROM crosschain_registrations WHERE source_agent_id=%s", (agent_id,))
-        for reg in record["registrations"]:
-            parsed = parse_registration_entry(reg.get("agentRegistry"))
-            if parsed:
-                cur.execute("""
+            cur.execute("DELETE FROM agent_services WHERE agent_id = %s", (record["agent_id"],))
+            for index, service in enumerate(record["services"], start=1):
+                cur.execute(
+                    """
+                    INSERT INTO agent_services (
+                        agent_id,
+                        service_order,
+                        service_name,
+                        endpoint,
+                        version,
+                        skills_json,
+                        domains_json
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        record["agent_id"],
+                        index,
+                        service.get("name"),
+                        service.get("endpoint"),
+                        service.get("version"),
+                        json.dumps(service.get("skills") or service.get("a2aSkills")),
+                        json.dumps(service.get("domains")),
+                    ),
+                )
+
+            cur.execute(
+                "DELETE FROM crosschain_registrations WHERE source_agent_id = %s",
+                (record["agent_id"],),
+            )
+            for registration in record["registrations"]:
+                parsed = parse_registration_entry(registration.get("agentRegistry"))
+                if not parsed:
+                    continue
+                cur.execute(
+                    """
                     INSERT INTO crosschain_registrations (
                         source_agent_id,
                         target_chain_namespace,
@@ -534,322 +603,274 @@ def write_metadata_record(record):
                         target_agent_id
                     )
                     VALUES (%s,%s,%s,%s,%s)
-                """, (
-                    agent_id,
-                    parsed["target_chain_namespace"],
-                    parsed["target_chain_id"],
-                    parsed["target_identity_registry"],
-                    reg.get("agentId"),
-                ))
+                    """,
+                    (
+                        record["agent_id"],
+                        parsed["target_chain_namespace"],
+                        parsed["target_chain_id"],
+                        parsed["target_identity_registry"],
+                        registration.get("agentId"),
+                    ),
+                )
 
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
 
-def run_stage_b(batch_size=500, max_workers=8):
-    rows = load_agents_for_metadata(batch_size)
-    print("Agents to enrich:", len(rows))
-
-    processed = 0
+def run_metadata_stage(
+    identity_records: Sequence[Dict[str, object]], config: PipelineConfig
+) -> Tuple[Dict[int, Dict[str, object]], Dict[str, int]]:
+    successful_records: Dict[int, Dict[str, object]] = {}
+    failed = 0
     skipped = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         future_map = {
-            executor.submit(process_one_metadata, agent_id, token_uri): (agent_id, token_uri)
-            for agent_id, token_uri in rows
+            executor.submit(fetch_metadata, record, config): record
+            for record in identity_records
         }
 
         for future in as_completed(future_map):
-            agent_id, token_uri = future_map[future]
+            identity_record = future_map[future]
+            agent_id = int(identity_record["agent_id"])
 
             try:
                 record = future.result()
-
                 if record is None:
                     skipped += 1
                     continue
 
-                write_metadata_record(record)
-                processed += 1
+                write_metadata_record(record, config.observation_block)
+                successful_records[agent_id] = record
+            except Exception as exc:
+                print(f"[metadata] failed agent_id={agent_id}: {repr(exc)}")
+                failed += 1
 
-            except Exception as e:
-                print(f"Parallel metadata skip agent {agent_id}: {repr(e)}")
-                skipped += 1
+    stats = {
+        "success": len(successful_records),
+        "failed": failed,
+        "skipped": skipped,
+    }
+    return successful_records, stats
 
-    print({
-        "metadata_processed": processed,
-        "metadata_skipped": skipped
-    })
 
 # =========================================================
-# Stage C — Reputation Enrichment
+# Reputation
 # =========================================================
 
-def load_agents_for_reputation(batch_size=200):
-    conn = get_db_conn()
-    cur = conn.cursor()
+def fetch_reputation(identity_record: Dict[str, object], observation_block: int) -> Dict[str, object]:
+    agent_id = int(identity_record["agent_id"])
 
-    try:
-        cur.execute("""
-            SELECT agent_id
-            FROM agents_core
-            WHERE agent_id NOT IN (
-                SELECT agent_id FROM agent_reputation_summary
+    clients = rep_contract.functions.getClients(agent_id).call(block_identifier=observation_block)
+    clients = [norm_addr(client) for client in clients]
+
+    feedback_count_total = 0
+    reputation_score_raw = 0
+    reputation_score_decimals = 0
+
+    if clients:
+        checksum_clients = [checksum(client) for client in clients if client]
+        count, raw_value, raw_decimals = rep_contract.functions.getSummary(
+            agent_id,
+            checksum_clients,
+            "",
+            "",
+        ).call(block_identifier=observation_block)
+
+        feedback_count_total = int(count)
+        reputation_score_raw = int(raw_value)
+        reputation_score_decimals = int(raw_decimals)
+
+    feedback_rows = []
+    for client in clients:
+        if not client:
+            continue
+
+        client_checksum = checksum(client)
+        last_index = int(
+            rep_contract.functions.getLastIndex(agent_id, client_checksum).call(
+                block_identifier=observation_block
             )
-            ORDER BY agent_id
-            LIMIT %s
-        """, (batch_size,))
-        rows = [r[0] for r in cur.fetchall()]
-        return rows
-    finally:
-        cur.close()
-        conn.close()
+        )
 
-def fetch_one_agent_reputation(agent_id, observation_block):
-    try:
-        clients = rep_contract.functions.getClients(int(agent_id)).call()
-        clients = [norm_addr(c) for c in clients]
+        for index in range(1, last_index + 1):
+            value_raw, value_decimals, tag1, tag2, revoked = rep_contract.functions.readFeedback(
+                agent_id,
+                client_checksum,
+                index,
+            ).call(block_identifier=observation_block)
 
-        feedback_count_total = 0
-        reputation_score_raw = 0
-        reputation_score_decimals = 0
-
-        if len(clients) > 0:
-            checksum_clients = [checksum(c) for c in clients]
-            count, raw_value, raw_decimals = rep_contract.functions.getSummary(
-                int(agent_id),
-                checksum_clients,
-                "",
-                ""
-            ).call()
-
-            feedback_count_total = int(count)
-            reputation_score_raw = int(raw_value)
-            reputation_score_decimals = int(raw_decimals)
-
-        feedback_rows = []
-
-        for client in clients:
-            client_cs = checksum(client)
-
-            try:
-                last_index = int(
-                    rep_contract.functions.getLastIndex(int(agent_id), client_cs).call()
+            feedback_rows.append(
+                (
+                    agent_id,
+                    client,
+                    int(index),
+                    int(value_raw),
+                    int(value_decimals),
+                    tag1,
+                    tag2,
+                    bool(revoked),
                 )
-            except Exception:
-                continue
+            )
 
-            for idx in range(1, last_index + 1):
-                try:
-                    value_raw, value_decimals, tag1, tag2, revoked = rep_contract.functions.readFeedback(
-                        int(agent_id),
-                        client_cs,
-                        idx
-                    ).call()
-
-                    feedback_rows.append((
-                        int(agent_id),
-                        client,
-                        int(idx),
-                        int(value_raw),
-                        int(value_decimals),
-                        tag1,
-                        tag2,
-                        bool(revoked)
-                    ))
-
-                except Exception:
-                    continue
-
-        summary = {
-            "agent_id": int(agent_id),
+    return {
+        "summary": {
+            "agent_id": agent_id,
             "client_count": len(clients),
             "feedback_count_total": feedback_count_total,
             "reputation_score_raw": reputation_score_raw,
             "reputation_score_decimals": reputation_score_decimals,
             "observation_block": observation_block,
             "observation_timestamp": datetime.now(timezone.utc),
-        }
+        },
+        "feedback_rows": feedback_rows,
+    }
 
-        return summary, feedback_rows
 
-    except Exception as e:
-        print(f"Skip reputation agent {agent_id}: {repr(e)}")
-        return None, []
-
-def write_reputation_record(summary, feedback_rows):
-    conn = get_db_conn()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("""
-            INSERT INTO agent_reputation_summary (
-                agent_id,
-                feedback_count_total,
-                reputation_score_raw,
-                reputation_score_decimals,
-                client_count,
-                observation_block,
-                observation_timestamp
-            )
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (agent_id) DO UPDATE SET
-                feedback_count_total = EXCLUDED.feedback_count_total,
-                reputation_score_raw = EXCLUDED.reputation_score_raw,
-                reputation_score_decimals = EXCLUDED.reputation_score_decimals,
-                client_count = EXCLUDED.client_count,
-                observation_block = EXCLUDED.observation_block,
-                observation_timestamp = EXCLUDED.observation_timestamp
-        """, (
-            summary["agent_id"],
-            summary["feedback_count_total"],
-            summary["reputation_score_raw"],
-            summary["reputation_score_decimals"],
-            summary["client_count"],
-            summary["observation_block"],
-            summary["observation_timestamp"],
-        ))
-
-        cur.execute("""
-            DELETE FROM agent_feedback_records
-            WHERE agent_id = %s
-        """, (summary["agent_id"],))
-
-        if feedback_rows:
-            execute_batch(cur, """
-                INSERT INTO agent_feedback_records (
+def write_reputation_record(summary: Dict[str, object], feedback_rows: Sequence[Tuple]) -> None:
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_reputation_summary (
                     agent_id,
-                    client_address,
-                    feedback_index,
-                    value_raw,
-                    value_decimals,
-                    tag1,
-                    tag2,
-                    is_revoked
+                    feedback_count_total,
+                    reputation_score_raw,
+                    reputation_score_decimals,
+                    client_count,
+                    observation_block,
+                    observation_timestamp
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            """, feedback_rows, page_size=500)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (agent_id) DO UPDATE SET
+                    feedback_count_total = EXCLUDED.feedback_count_total,
+                    reputation_score_raw = EXCLUDED.reputation_score_raw,
+                    reputation_score_decimals = EXCLUDED.reputation_score_decimals,
+                    client_count = EXCLUDED.client_count,
+                    observation_block = EXCLUDED.observation_block,
+                    observation_timestamp = EXCLUDED.observation_timestamp
+                """,
+                (
+                    summary["agent_id"],
+                    summary["feedback_count_total"],
+                    summary["reputation_score_raw"],
+                    summary["reputation_score_decimals"],
+                    summary["client_count"],
+                    summary["observation_block"],
+                    summary["observation_timestamp"],
+                ),
+            )
 
-        conn.commit()
+            cur.execute(
+                "DELETE FROM agent_feedback_records WHERE agent_id = %s",
+                (summary["agent_id"],),
+            )
 
-    finally:
-        cur.close()
-        conn.close()
+            if feedback_rows:
+                execute_batch(
+                    cur,
+                    """
+                    INSERT INTO agent_feedback_records (
+                        agent_id,
+                        client_address,
+                        feedback_index,
+                        value_raw,
+                        value_decimals,
+                        tag1,
+                        tag2,
+                        is_revoked
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    list(feedback_rows),
+                    page_size=500,
+                )
 
-def run_stage_c(batch_size=200, max_workers=8):
-    agent_ids = load_agents_for_reputation(batch_size)
-    observation_block = w3.eth.block_number
 
-    print("Reputation observation block:", observation_block)
-    print("Agents to enrich reputation:", len(agent_ids))
-
-    processed = 0
+def run_reputation_stage(
+    identity_records: Sequence[Dict[str, object]], config: PipelineConfig
+) -> Tuple[Dict[int, Dict[str, object]], Dict[str, int]]:
+    successful_records: Dict[int, Dict[str, object]] = {}
+    failed = 0
     skipped = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         future_map = {
-            executor.submit(fetch_one_agent_reputation, agent_id, observation_block): agent_id
-            for agent_id in agent_ids
+            executor.submit(fetch_reputation, record, config.observation_block): record
+            for record in identity_records
         }
 
         for future in as_completed(future_map):
-            agent_id = future_map[future]
+            identity_record = future_map[future]
+            agent_id = int(identity_record["agent_id"])
 
             try:
-                summary, feedback_rows = future.result()
+                result = future.result()
+                write_reputation_record(result["summary"], result["feedback_rows"])
+                successful_records[agent_id] = result
+            except Exception as exc:
+                print(f"[reputation] failed agent_id={agent_id}: {repr(exc)}")
+                failed += 1
 
-                if summary is None:
-                    skipped += 1
-                    continue
+    stats = {
+        "success": len(successful_records),
+        "failed": failed,
+        "skipped": skipped,
+    }
+    return successful_records, stats
 
-                write_reputation_record(summary, feedback_rows)
-                processed += 1
-
-            except Exception as e:
-                print(f"Parallel skip agent {agent_id}: {repr(e)}")
-                skipped += 1
-
-    print({
-        "reputation_processed": processed,
-        "reputation_skipped": skipped
-    })
-
-def run_stage_c_until_done(batch_size=200):
-    total_processed = 0
-    observation_block = w3.eth.block_number
-
-    print("Reputation observation block:", observation_block)
-
-    while True:
-        agent_ids = load_agents_for_reputation(batch_size)
-
-        if len(agent_ids) == 0:
-            break
-
-        print(f"Processing batch of {len(agent_ids)} agents...")
-
-        processed = 0
-        skipped = 0
-
-        for agent_id in agent_ids:
-            summary, feedback_rows = fetch_one_agent_reputation(agent_id, observation_block)
-
-            if summary is None:
-                skipped += 1
-                continue
-
-            write_reputation_record(summary, feedback_rows)
-            processed += 1
-
-        total_processed += processed
-
-        print({
-            "batch_processed": processed,
-            "batch_skipped": skipped,
-            "total_processed_so_far": total_processed
-        })
-
-    print("All remaining reputation agents completed.")
 
 # =========================================================
-# CLI
+# Pipeline
 # =========================================================
 
-def main():
-    parser = argparse.ArgumentParser(description="ERC-8004 V3 pipeline runner")
-    parser.add_argument("--stage", required=True, choices=["a", "b", "c", "c_all"])
-    parser.add_argument("--start-block", type=int, default=None)
-    parser.add_argument("--end-block", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--max-workers", type=int, default=None)
+def print_batch_stats(stage_name: str, batch_number: int, stats: Dict[str, int]) -> None:
+    print(
+        f"[batch {batch_number}] {stage_name}: "
+        f"success={stats['success']} failed={stats['failed']} skipped={stats['skipped']}"
+    )
 
-    args = parser.parse_args()
 
-    global MAX_WORKERS
-    if args.max_workers is not None:
-        MAX_WORKERS = args.max_workers
-
+def run_pipeline(config: PipelineConfig) -> None:
     print("Connected:", w3.is_connected())
     print("Latest block:", w3.eth.block_number)
-    print("Stage:", args.stage)
+    print("Start block:", config.start_block)
+    print("Observation block:", config.observation_block)
+    print(
+        "Target agent ids:",
+        f"{config.target_agent_id_min}-{config.target_agent_id_max}",
+    )
+    print("Target agent count:", config.target_agent_count)
+    print("Pipeline batch size:", config.pipeline_batch_size)
 
-    if args.stage == "a":
-        if args.start_block is None or args.end_block is None:
-            raise ValueError("Stage A requires --start-block and --end-block")
-        run_stage_a(args.start_block, args.end_block)
+    discovered_agents = discover_target_agents(config)
+    if not discovered_agents:
+        print("No agents discovered for the current configuration.")
+        return
 
-    elif args.stage == "b":
-        batch_size = args.batch_size if args.batch_size is not None else 500
-        run_stage_b(batch_size=batch_size, max_workers=MAX_WORKERS)
+    for batch_number, agent_batch in enumerate(
+        chunked(discovered_agents, config.pipeline_batch_size),
+        start=1,
+    ):
+        batch_agent_ids = [int(agent["agent_id"]) for agent in agent_batch]
+        print(f"[batch {batch_number}] agent_ids={batch_agent_ids[0]}-{batch_agent_ids[-1]}")
 
-    elif args.stage == "c":
-        batch_size = args.batch_size if args.batch_size is not None else 200
-        run_stage_c(batch_size=batch_size, max_workers=MAX_WORKERS)
+        identity_records, identity_stats = run_identity_stage(agent_batch, config)
+        print_batch_stats("identity", batch_number, identity_stats)
 
-    elif args.stage == "c_all":
-        batch_size = args.batch_size if args.batch_size is not None else 200
-        run_stage_c_until_done(batch_size=batch_size)
+        if not identity_records:
+            print(f"[batch {batch_number}] no identity records succeeded, skipping downstream stages")
+            continue
+
+        _, metadata_stats = run_metadata_stage(identity_records, config)
+        print_batch_stats("metadata", batch_number, metadata_stats)
+
+        _, reputation_stats = run_reputation_stage(identity_records, config)
+        print_batch_stats("reputation", batch_number, reputation_stats)
+
+    print("Pipeline completed.")
+
+
+def main() -> None:
+    run_pipeline(PipelineConfig())
+
 
 if __name__ == "__main__":
     main()

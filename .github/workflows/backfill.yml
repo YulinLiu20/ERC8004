@@ -2,37 +2,6 @@ name: ERC8004 Manual Run
 
 on:
   workflow_dispatch:
-    inputs:
-      stage:
-        description: "Which stage to run: a, b, c, c_all"
-        required: true
-        default: "b"
-        type: choice
-        options:
-          - a
-          - b
-          - c
-          - c_all
-      start_block:
-        description: "Required only for stage a"
-        required: false
-        default: ""
-        type: string
-      end_block:
-        description: "Required only for stage a"
-        required: false
-        default: ""
-        type: string
-      batch_size:
-        description: "Optional for stage b / c / c_all"
-        required: false
-        default: ""
-        type: string
-      max_workers:
-        description: "Optional thread workers"
-        required: false
-        default: "8"
-        type: string
 
 jobs:
   run:
@@ -54,21 +23,4 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run pipeline
-        shell: bash
-        run: |
-          CMD="python scripts/erc8004_pipeline.py --stage ${{ inputs.stage }} --max-workers ${{ inputs.max_workers }}"
-
-          if [ -n "${{ inputs.start_block }}" ]; then
-            CMD="$CMD --start-block ${{ inputs.start_block }}"
-          fi
-
-          if [ -n "${{ inputs.end_block }}" ]; then
-            CMD="$CMD --end-block ${{ inputs.end_block }}"
-          fi
-
-          if [ -n "${{ inputs.batch_size }}" ]; then
-            CMD="$CMD --batch-size ${{ inputs.batch_size }}"
-          fi
-
-          echo "Running: $CMD"
-          eval $CMD
+        run: python scripts/main.py
