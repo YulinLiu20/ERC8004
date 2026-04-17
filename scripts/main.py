@@ -14,9 +14,13 @@ from web3 import Web3
 # =========================================================
 # User Configuration
 # Edit these values in code before running the workflow.
+# For production backfills with a fixed observation_block, the RPC must support
+# historical eth_call at that block height. In GitHub Actions we wire the
+# Ethereum_archive_RPC secret into the ETHEREUM_ARCHIVE_RPC environment variable.
 # =========================================================
 
-RPC_URL = "https://ethereum-rpc.publicnode.com"
+DEFAULT_RPC_URL = "https://ethereum-rpc.publicnode.com"
+RPC_URL = os.environ.get("ETHEREUM_ARCHIVE_RPC") or DEFAULT_RPC_URL
 NEON_DATABASE_URL = os.environ["NEON_DATABASE_URL"]
 
 CHAIN_ID = 1

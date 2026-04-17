@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      ETHEREUM_ARCHIVE_RPC: ${{ secrets.Ethereum_archive_RPC }}
       NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
 
     steps:
