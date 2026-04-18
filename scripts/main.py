@@ -62,7 +62,7 @@ SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
 # Manual rerun controls
 # -----------------------------
 RERUN_AGENT_IDS: List[int] = []
-RERUN_STAGES = ["identity", "metadata", "reputation"]
+RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
 RERUN_ONLY = False
 
 RUN_IDENTITY = True
@@ -91,7 +91,7 @@ class PipelineConfig:
     rpc_max_in_flight: int = RPC_MAX_IN_FLIGHT
     rpc_min_interval_seconds: float = RPC_MIN_INTERVAL_SECONDS
     rerun_agent_ids: Tuple[int, ...] = tuple(RERUN_AGENT_IDS)
-    rerun_stages: Tuple[str, ...] = tuple(RERUN_STAGES)
+    rerun_only_stages: Tuple[str, ...] = tuple(RERUN_ONLY_STAGES)
     rerun_only: bool = RERUN_ONLY
     run_identity: bool = RUN_IDENTITY
     run_metadata: bool = RUN_METADATA
@@ -151,11 +151,20 @@ def resolve_token_uri(token_uri: Optional[str]) -> Optional[str]:
 
 
 def parse_data_uri_json(url: str) -> Optional[Dict[str, object]]:
-    prefix = "data:application/json;base64,"
-    if not url.startswith(prefix):
+    if not url.startswith("data:"):
         return None
-    encoded = url[len(prefix):]
-    decoded_bytes = base64.b64decode(encoded)
+
+    header, sep, payload = url.partition(",")
+    if not sep:
+        return None
+
+    header_lower = header.lower()
+    if "application/json" not in header_lower:
+        return None
+    if ";base64" not in header_lower:
+        return None
+
+    decoded_bytes = base64.b64decode(payload)
     decoded_text = decoded_bytes.decode("utf-8")
     return json.loads(decoded_text)
 
@@ -664,6 +673,9 @@ def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -
     services = metadata.get("services", [])
     supported_trust = metadata.get("supportedTrust", [])
     registrations = metadata.get("registrations", [])
+    x402_support = metadata.get("x402Support")
+    if x402_support is None:
+        x402_support = metadata.get("x402support")
 
     return {
         "agent_id": identity_record["agent_id"],
@@ -673,7 +685,7 @@ def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -
         "name": metadata.get("name"),
         "description": metadata.get("description"),
         "image_url": metadata.get("image"),
-        "x402_support": metadata.get("x402support"),
+        "x402_support": x402_support,
         "active": metadata.get("active"),
         "service_count": len(services),
         "trust_count": len(supported_trust),
@@ -1156,6 +1168,7 @@ def run_pipeline(config: PipelineConfig) -> None:
     })
     print("Rerun only:", config.rerun_only)
     print("Rerun agent ids:", list(config.rerun_agent_ids))
+    print("Rerun-only stages:", list(config.rerun_only_stages))
 
     failed_identity_agents: List[int] = []
     failed_metadata_agents: List[int] = []
@@ -1165,7 +1178,7 @@ def run_pipeline(config: PipelineConfig) -> None:
         target_ids = sorted(set(int(agent_id) for agent_id in config.rerun_agent_ids))
         print(f"[rerun] running only specified agent ids: {target_ids}")
 
-        if config.run_identity and "identity" in config.rerun_stages:
+        if config.run_identity and "identity" in config.rerun_only_stages:
             discovered_agents, missing_identity_seed_ids = load_identity_seeds_from_db(target_ids)
             failed_identity_agents.extend(missing_identity_seed_ids)
             identity_records, identity_stats = run_identity_stage(discovered_agents, config)
@@ -1177,6 +1190,11 @@ def run_pipeline(config: PipelineConfig) -> None:
         else:
             identity_records, missing_identity_record_ids = load_identity_records_from_db(target_ids)
             failed_identity_agents.extend(missing_identity_record_ids)
+            if missing_identity_record_ids:
+                print(
+                    "[rerun] missing prerequisite identity records in DB for agent_ids="
+                    f"{missing_identity_record_ids}"
+                )
     else:
         discovered_agents = discover_target_agents(config)
         if not discovered_agents:
@@ -1221,18 +1239,18 @@ def run_pipeline(config: PipelineConfig) -> None:
     if config.rerun_only and config.rerun_agent_ids:
         target_ids = sorted(set(int(agent_id) for agent_id in config.rerun_agent_ids))
 
-        if config.run_metadata and "metadata" in config.rerun_stages and identity_records:
+        if config.run_metadata and "metadata" in config.rerun_only_stages and identity_records:
             _, metadata_stats = run_metadata_stage(identity_records, config)
             print_batch_stats("metadata", 1, metadata_stats)
             failed_metadata_agents.extend(metadata_stats["failed_agent_ids"])
-        elif config.run_metadata and "metadata" in config.rerun_stages:
+        elif config.run_metadata and "metadata" in config.rerun_only_stages:
             failed_metadata_agents.extend(target_ids)
 
-        if config.run_reputation and "reputation" in config.rerun_stages and identity_records:
+        if config.run_reputation and "reputation" in config.rerun_only_stages and identity_records:
             _, reputation_stats = run_reputation_stage(identity_records, config)
             print_batch_stats("reputation", 1, reputation_stats)
             failed_reputation_agents.extend(reputation_stats["failed_agent_ids"])
-        elif config.run_reputation and "reputation" in config.rerun_stages:
+        elif config.run_reputation and "reputation" in config.rerun_only_stages:
             failed_reputation_agents.extend(target_ids)
 
     final_failed_identity = sorted(set(failed_identity_agents))
@@ -1246,6 +1264,7 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("FINAL_FAILED_METADATA =", final_failed_metadata)
     print("FINAL_FAILED_REPUTATION =", final_failed_reputation)
     print("FINAL_FAILED_ALL =", final_failed_all)
+    print("RERUN_AGENT_IDS =", final_failed_all)
 
     failed_agents_summary = {
         "identity": final_failed_identity,
