@@ -2,6 +2,8 @@ import json
 import os
 import random
 import time
+import threading
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -45,13 +47,27 @@ TARGET_AGENT_COUNT = 10000
 SCAN_BLOCK_WINDOW = 500
 PIPELINE_BATCH_SIZE = 50
 MAX_WORKERS = 4
+REPUTATION_MAX_WORKERS = 2
 HTTP_TIMEOUT = 20
 RPC_MAX_RETRIES = 6
 RPC_RETRY_BASE_DELAY_SECONDS = 0.5
 RPC_BACKOFF_JITTER_SECONDS = 0.25
+RPC_MAX_IN_FLIGHT = 2
+RPC_MIN_INTERVAL_SECONDS = 0.05
 FAIL_ON_INCOMPLETE_SNAPSHOT = True
 SECOND_PASS_RETRY_ENABLED = True
 SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
+
+# -----------------------------
+# Manual rerun controls
+# -----------------------------
+RERUN_AGENT_IDS: List[int] = []
+RERUN_STAGES = ["identity", "metadata", "reputation"]
+RERUN_ONLY = False
+
+RUN_IDENTITY = True
+RUN_METADATA = True
+RUN_REPUTATION = True
 
 
 @dataclass(frozen=True)
@@ -64,6 +80,7 @@ class PipelineConfig:
     scan_block_window: int = SCAN_BLOCK_WINDOW
     pipeline_batch_size: int = PIPELINE_BATCH_SIZE
     max_workers: int = MAX_WORKERS
+    reputation_max_workers: int = REPUTATION_MAX_WORKERS
     http_timeout: int = HTTP_TIMEOUT
     rpc_max_retries: int = RPC_MAX_RETRIES
     rpc_retry_base_delay_seconds: float = RPC_RETRY_BASE_DELAY_SECONDS
@@ -71,9 +88,20 @@ class PipelineConfig:
     fail_on_incomplete_snapshot: bool = FAIL_ON_INCOMPLETE_SNAPSHOT
     second_pass_retry_enabled: bool = SECOND_PASS_RETRY_ENABLED
     second_pass_retry_delay_seconds: float = SECOND_PASS_RETRY_DELAY_SECONDS
+    rpc_max_in_flight: int = RPC_MAX_IN_FLIGHT
+    rpc_min_interval_seconds: float = RPC_MIN_INTERVAL_SECONDS
+    rerun_agent_ids: Tuple[int, ...] = tuple(RERUN_AGENT_IDS)
+    rerun_stages: Tuple[str, ...] = tuple(RERUN_STAGES)
+    rerun_only: bool = RERUN_ONLY
+    run_identity: bool = RUN_IDENTITY
+    run_metadata: bool = RUN_METADATA
+    run_reputation: bool = RUN_REPUTATION
 
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
+RPC_SEMAPHORE = threading.BoundedSemaphore(max(1, RPC_MAX_IN_FLIGHT))
+RPC_THROTTLE_LOCK = threading.Lock()
+RPC_NEXT_ALLOWED_AT = 0.0
 
 
 # =========================================================
@@ -122,6 +150,16 @@ def resolve_token_uri(token_uri: Optional[str]) -> Optional[str]:
     return token_uri
 
 
+def parse_data_uri_json(url: str) -> Optional[Dict[str, object]]:
+    prefix = "data:application/json;base64,"
+    if not url.startswith(prefix):
+        return None
+    encoded = url[len(prefix):]
+    decoded_bytes = base64.b64decode(encoded)
+    decoded_text = decoded_bytes.decode("utf-8")
+    return json.loads(decoded_text)
+
+
 def get_db_conn():
     return psycopg2.connect(NEON_DATABASE_URL)
 
@@ -138,13 +176,22 @@ def _is_retryable_rpc_exception(exc: Exception) -> bool:
 
 
 def rpc_call_with_retry(callable_fn, config: PipelineConfig, context: str):
+    global RPC_NEXT_ALLOWED_AT
+
     attempts = max(1, int(config.rpc_max_retries))
     delay_seconds = max(0.0, float(config.rpc_retry_base_delay_seconds))
     jitter_seconds = max(0.0, float(config.rpc_backoff_jitter_seconds))
 
     for attempt in range(1, attempts + 1):
         try:
-            return callable_fn()
+            with RPC_SEMAPHORE:
+                with RPC_THROTTLE_LOCK:
+                    now = time.monotonic()
+                    wait_for = RPC_NEXT_ALLOWED_AT - now
+                    if wait_for > 0:
+                        time.sleep(wait_for)
+                    RPC_NEXT_ALLOWED_AT = time.monotonic() + max(0.0, config.rpc_min_interval_seconds)
+                return callable_fn()
         except Exception as exc:
             if attempt >= attempts or not _is_retryable_rpc_exception(exc):
                 raise
@@ -515,7 +562,7 @@ def run_identity_stage(
     skipped = 0
     failed_seeds: List[Dict[str, object]] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
             executor.submit(fetch_identity_state, seed, config.observation_block, config): seed
             for seed in agent_seeds
@@ -599,9 +646,20 @@ def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -
     if not resolved_url:
         return None
 
-    response = requests.get(resolved_url, timeout=config.http_timeout)
-    response.raise_for_status()
-    metadata = response.json()
+    metadata_from_data_uri = parse_data_uri_json(resolved_url)
+    if metadata_from_data_uri is not None:
+        metadata = metadata_from_data_uri
+        content_type = "application/json"
+    else:
+        response = requests.get(resolved_url, timeout=config.http_timeout)
+        response.raise_for_status()
+        if response.text.strip() == "":
+            raise ValueError("metadata response body is empty")
+        try:
+            metadata = response.json()
+        except Exception as exc:
+            raise ValueError(f"metadata response is not valid JSON: {repr(exc)}") from exc
+        content_type = response.headers.get("Content-Type", "")
 
     services = metadata.get("services", [])
     supported_trust = metadata.get("supportedTrust", [])
@@ -610,7 +668,7 @@ def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -
     return {
         "agent_id": identity_record["agent_id"],
         "resolved_url": resolved_url,
-        "content_type": response.headers.get("Content-Type", ""),
+        "content_type": content_type,
         "metadata_updated_at": parse_unix_ts(metadata.get("updatedAt")),
         "name": metadata.get("name"),
         "description": metadata.get("description"),
@@ -737,8 +795,9 @@ def run_metadata_stage(
     successful_records: Dict[int, Dict[str, object]] = {}
     failed = 0
     skipped = 0
+    failed_agent_ids: List[int] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
             executor.submit(fetch_metadata, record, config): record
             for record in identity_records
@@ -759,11 +818,13 @@ def run_metadata_stage(
             except Exception as exc:
                 print(f"[metadata] failed agent_id={agent_id}: {repr(exc)}")
                 failed += 1
+                failed_agent_ids.append(agent_id)
 
     stats = {
         "success": len(successful_records),
         "failed": failed,
         "skipped": skipped,
+        "failed_agent_ids": failed_agent_ids,
     }
     return successful_records, stats
 
@@ -930,7 +991,7 @@ def run_reputation_stage(
     failed_agent_ids: List[int] = []
     failed_identity_records: List[Dict[str, object]] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
             executor.submit(fetch_reputation, record, config.observation_block, config): record
             for record in identity_records
@@ -990,6 +1051,86 @@ def run_reputation_stage(
 # Pipeline
 # =========================================================
 
+def load_identity_seeds_from_db(agent_ids: Sequence[int]) -> Tuple[List[Dict[str, object]], List[int]]:
+    if not agent_ids:
+        return [], []
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT agent_id, mint_block, mint_tx_hash
+                FROM agents_core
+                WHERE agent_id = ANY(%s)
+                """,
+                (list(agent_ids),),
+            )
+            rows = cur.fetchall()
+
+    seeds = []
+    found_ids = set()
+    for agent_id, mint_block, mint_tx_hash in rows:
+        found_ids.add(int(agent_id))
+        if mint_block is None or mint_tx_hash is None:
+            continue
+        seeds.append(
+            {
+                "agent_id": int(agent_id),
+                "mint_block": int(mint_block),
+                "mint_tx_hash": norm_tx_hash(mint_tx_hash),
+            }
+        )
+    missing_ids = sorted(set(agent_ids) - {int(seed["agent_id"]) for seed in seeds})
+    return sorted(seeds, key=lambda x: int(x["agent_id"])), missing_ids
+
+
+def load_identity_records_from_db(agent_ids: Sequence[int]) -> Tuple[List[Dict[str, object]], List[int]]:
+    if not agent_ids:
+        return [], []
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    agent_id,
+                    mint_block,
+                    mint_timestamp,
+                    mint_tx_hash,
+                    owner_wallet,
+                    agent_wallet,
+                    token_uri,
+                    metadata_hosting_type,
+                    lifecycle_status,
+                    observation_block,
+                    observation_timestamp
+                FROM agents_core
+                WHERE agent_id = ANY(%s)
+                """,
+                (list(agent_ids),),
+            )
+            rows = cur.fetchall()
+
+    records = []
+    for row in rows:
+        records.append(
+            {
+                "agent_id": int(row[0]),
+                "mint_block": int(row[1]) if row[1] is not None else None,
+                "mint_timestamp": row[2],
+                "mint_tx_hash": norm_tx_hash(row[3]),
+                "owner_wallet": norm_addr(row[4]),
+                "agent_wallet": norm_addr(row[5]) if row[5] else None,
+                "token_uri": row[6],
+                "metadata_hosting_type": row[7],
+                "lifecycle_status": row[8],
+                "observation_block": int(row[9]) if row[9] is not None else None,
+                "observation_timestamp": row[10],
+            }
+        )
+    missing_ids = sorted(set(agent_ids) - {int(record["agent_id"]) for record in records})
+    return sorted(records, key=lambda x: int(x["agent_id"])), missing_ids
+
 def print_batch_stats(stage_name: str, batch_number: int, stats: Dict[str, int]) -> None:
     print(
         f"[batch {batch_number}] {stage_name}: "
@@ -1008,60 +1149,119 @@ def run_pipeline(config: PipelineConfig) -> None:
     )
     print("Target agent count:", config.target_agent_count)
     print("Pipeline batch size:", config.pipeline_batch_size)
+    print("Run stages:", {
+        "identity": config.run_identity,
+        "metadata": config.run_metadata,
+        "reputation": config.run_reputation,
+    })
+    print("Rerun only:", config.rerun_only)
+    print("Rerun agent ids:", list(config.rerun_agent_ids))
 
-    discovered_agents = discover_target_agents(config)
-    if not discovered_agents:
-        print("No agents discovered for the current configuration.")
-        return
+    failed_identity_agents: List[int] = []
+    failed_metadata_agents: List[int] = []
+    failed_reputation_agents: List[int] = []
 
-    total_identity_failed_ids: List[int] = []
-    total_reputation_failed_ids: List[int] = []
+    if config.rerun_only and config.rerun_agent_ids:
+        target_ids = sorted(set(int(agent_id) for agent_id in config.rerun_agent_ids))
+        print(f"[rerun] running only specified agent ids: {target_ids}")
 
-    for batch_number, agent_batch in enumerate(
-        chunked(discovered_agents, config.pipeline_batch_size),
-        start=1,
-    ):
-        batch_agent_ids = [int(agent["agent_id"]) for agent in agent_batch]
-        print(f"[batch {batch_number}] agent_ids={batch_agent_ids[0]}-{batch_agent_ids[-1]}")
-
-        identity_records, identity_stats = run_identity_stage(agent_batch, config)
-        print_batch_stats("identity", batch_number, identity_stats)
-        if identity_stats["failed"] > 0:
+        if config.run_identity and "identity" in config.rerun_stages:
+            discovered_agents, missing_identity_seed_ids = load_identity_seeds_from_db(target_ids)
+            failed_identity_agents.extend(missing_identity_seed_ids)
+            identity_records, identity_stats = run_identity_stage(discovered_agents, config)
+            print_batch_stats("identity", 1, identity_stats)
             succeeded_ids = {int(record["agent_id"]) for record in identity_records}
-            batch_failed_ids = [
-                agent_id for agent_id in batch_agent_ids if agent_id not in succeeded_ids
-            ]
-            total_identity_failed_ids.extend(batch_failed_ids)
+            failed_identity_agents.extend(
+                [agent_id for agent_id in target_ids if agent_id not in succeeded_ids]
+            )
+        else:
+            identity_records, missing_identity_record_ids = load_identity_records_from_db(target_ids)
+            failed_identity_agents.extend(missing_identity_record_ids)
+    else:
+        discovered_agents = discover_target_agents(config)
+        if not discovered_agents:
+            print("No agents discovered for the current configuration.")
+            return
 
-        if not identity_records:
-            print(f"[batch {batch_number}] no identity records succeeded, skipping downstream stages")
-            continue
+        identity_records = []
+        for batch_number, agent_batch in enumerate(
+            chunked(discovered_agents, config.pipeline_batch_size),
+            start=1,
+        ):
+            batch_agent_ids = [int(agent["agent_id"]) for agent in agent_batch]
+            print(f"[batch {batch_number}] agent_ids={batch_agent_ids[0]}-{batch_agent_ids[-1]}")
 
-        _, metadata_stats = run_metadata_stage(identity_records, config)
-        print_batch_stats("metadata", batch_number, metadata_stats)
+            if config.run_identity:
+                batch_identity_records, identity_stats = run_identity_stage(agent_batch, config)
+                print_batch_stats("identity", batch_number, identity_stats)
+                succeeded_ids = {int(record["agent_id"]) for record in batch_identity_records}
+                failed_identity_agents.extend(
+                    [agent_id for agent_id in batch_agent_ids if agent_id not in succeeded_ids]
+                )
+            else:
+                batch_identity_records, missing_ids = load_identity_records_from_db(batch_agent_ids)
+                failed_identity_agents.extend(missing_ids)
 
-        _, reputation_stats = run_reputation_stage(identity_records, config)
-        print_batch_stats("reputation", batch_number, reputation_stats)
-        total_reputation_failed_ids.extend(reputation_stats["failed_agent_ids"])
+            if not batch_identity_records:
+                print(f"[batch {batch_number}] no identity records available, skipping downstream stages")
+                continue
 
-    if total_identity_failed_ids:
-        print(
-            f"[summary] identity failed agent_ids count={len(total_identity_failed_ids)} "
-            f"ids={sorted(set(total_identity_failed_ids))}"
-        )
-    if total_reputation_failed_ids:
-        print(
-            f"[summary] reputation failed agent_ids count={len(total_reputation_failed_ids)} "
-            f"ids={sorted(set(total_reputation_failed_ids))}"
-        )
+            if config.run_metadata:
+                _, metadata_stats = run_metadata_stage(batch_identity_records, config)
+                print_batch_stats("metadata", batch_number, metadata_stats)
+                failed_metadata_agents.extend(metadata_stats["failed_agent_ids"])
 
-    if config.fail_on_incomplete_snapshot and (
-        total_identity_failed_ids or total_reputation_failed_ids
-    ):
+            if config.run_reputation:
+                _, reputation_stats = run_reputation_stage(batch_identity_records, config)
+                print_batch_stats("reputation", batch_number, reputation_stats)
+                failed_reputation_agents.extend(reputation_stats["failed_agent_ids"])
+
+            identity_records.extend(batch_identity_records)
+
+    if config.rerun_only and config.rerun_agent_ids:
+        target_ids = sorted(set(int(agent_id) for agent_id in config.rerun_agent_ids))
+
+        if config.run_metadata and "metadata" in config.rerun_stages and identity_records:
+            _, metadata_stats = run_metadata_stage(identity_records, config)
+            print_batch_stats("metadata", 1, metadata_stats)
+            failed_metadata_agents.extend(metadata_stats["failed_agent_ids"])
+        elif config.run_metadata and "metadata" in config.rerun_stages:
+            failed_metadata_agents.extend(target_ids)
+
+        if config.run_reputation and "reputation" in config.rerun_stages and identity_records:
+            _, reputation_stats = run_reputation_stage(identity_records, config)
+            print_batch_stats("reputation", 1, reputation_stats)
+            failed_reputation_agents.extend(reputation_stats["failed_agent_ids"])
+        elif config.run_reputation and "reputation" in config.rerun_stages:
+            failed_reputation_agents.extend(target_ids)
+
+    final_failed_identity = sorted(set(failed_identity_agents))
+    final_failed_metadata = sorted(set(failed_metadata_agents))
+    final_failed_reputation = sorted(set(failed_reputation_agents))
+    final_failed_all = sorted(
+        set(final_failed_identity + final_failed_metadata + final_failed_reputation)
+    )
+
+    print("FINAL_FAILED_IDENTITY =", final_failed_identity)
+    print("FINAL_FAILED_METADATA =", final_failed_metadata)
+    print("FINAL_FAILED_REPUTATION =", final_failed_reputation)
+    print("FINAL_FAILED_ALL =", final_failed_all)
+
+    failed_agents_summary = {
+        "identity": final_failed_identity,
+        "metadata": final_failed_metadata,
+        "reputation": final_failed_reputation,
+        "all_failed": final_failed_all,
+    }
+    with open("failed_agents_last_run.json", "w", encoding="utf-8") as f:
+        json.dump(failed_agents_summary, f, ensure_ascii=False, indent=2)
+
+    if config.fail_on_incomplete_snapshot and final_failed_all:
         raise RuntimeError(
             "Pipeline finished with incomplete snapshot. "
-            f"identity_failed={len(total_identity_failed_ids)} "
-            f"reputation_failed={len(total_reputation_failed_ids)}"
+            f"identity_failed={len(final_failed_identity)} "
+            f"metadata_failed={len(final_failed_metadata)} "
+            f"reputation_failed={len(final_failed_reputation)}"
         )
 
     print("Pipeline completed.")
