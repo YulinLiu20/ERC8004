@@ -65,9 +65,9 @@ RERUN_AGENT_IDS: List[int] = []
 RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
 RERUN_ONLY = False
 
-RUN_IDENTITY = False
-RUN_METADATA = False
-RUN_REPUTATION = False
+RUN_IDENTITY = True
+RUN_METADATA = True
+RUN_REPUTATION = True
 
 
 @dataclass(frozen=True)
@@ -416,8 +416,6 @@ def fetch_identity_state(
         "token_uri": token_uri,
         "metadata_hosting_type": detect_hosting_type(token_uri),
         "lifecycle_status": "metadata_linked" if token_uri else "minted_only",
-        "observation_block": observation_block,
-        "observation_timestamp": datetime.now(timezone.utc),
     }
 
 
@@ -436,8 +434,6 @@ def upsert_agents_core(records: Sequence[Dict[str, object]]) -> None:
             record["token_uri"],
             record["metadata_hosting_type"],
             record["lifecycle_status"],
-            record["observation_block"],
-            record["observation_timestamp"],
         )
         for record in records
     ]
@@ -456,11 +452,9 @@ def upsert_agents_core(records: Sequence[Dict[str, object]]) -> None:
                     agent_wallet,
                     token_uri,
                     metadata_hosting_type,
-                    lifecycle_status,
-                    observation_block,
-                    observation_timestamp
+                    lifecycle_status
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (agent_id) DO UPDATE SET
                     mint_block = EXCLUDED.mint_block,
                     mint_timestamp = EXCLUDED.mint_timestamp,
@@ -469,9 +463,7 @@ def upsert_agents_core(records: Sequence[Dict[str, object]]) -> None:
                     agent_wallet = EXCLUDED.agent_wallet,
                     token_uri = EXCLUDED.token_uri,
                     metadata_hosting_type = EXCLUDED.metadata_hosting_type,
-                    lifecycle_status = EXCLUDED.lifecycle_status,
-                    observation_block = EXCLUDED.observation_block,
-                    observation_timestamp = EXCLUDED.observation_timestamp
+                    lifecycle_status = EXCLUDED.lifecycle_status
                 """,
                 rows,
                 page_size=500,
@@ -695,9 +687,7 @@ def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -
     }
 
 
-def write_metadata_record(record: Dict[str, object], _observation_block: int) -> None:
-    # token_uri is read at observation_block, but the fetched JSON content may be
-    # newer when the URI points to mutable HTTPS-hosted metadata.
+def write_metadata_record(record: Dict[str, object]) -> None:
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -825,7 +815,7 @@ def run_metadata_stage(
                     skipped += 1
                     continue
 
-                write_metadata_record(record, config.observation_block)
+                write_metadata_record(record)
                 successful_records[agent_id] = record
             except Exception as exc:
                 print(f"[metadata] failed agent_id={agent_id}: {repr(exc)}")
@@ -927,8 +917,6 @@ def fetch_reputation(
             "feedback_count_total": feedback_count_total,
             "reputation_score_raw": reputation_score_raw,
             "reputation_score_decimals": reputation_score_decimals,
-            "observation_block": observation_block,
-            "observation_timestamp": datetime.now(timezone.utc),
         },
         "feedback_rows": feedback_rows,
     }
@@ -944,18 +932,14 @@ def write_reputation_record(summary: Dict[str, object], feedback_rows: Sequence[
                     feedback_count_total,
                     reputation_score_raw,
                     reputation_score_decimals,
-                    client_count,
-                    observation_block,
-                    observation_timestamp
+                    client_count
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (agent_id) DO UPDATE SET
                     feedback_count_total = EXCLUDED.feedback_count_total,
                     reputation_score_raw = EXCLUDED.reputation_score_raw,
                     reputation_score_decimals = EXCLUDED.reputation_score_decimals,
-                    client_count = EXCLUDED.client_count,
-                    observation_block = EXCLUDED.observation_block,
-                    observation_timestamp = EXCLUDED.observation_timestamp
+                    client_count = EXCLUDED.client_count
                 """,
                 (
                     summary["agent_id"],
@@ -963,8 +947,6 @@ def write_reputation_record(summary: Dict[str, object], feedback_rows: Sequence[
                     summary["reputation_score_raw"],
                     summary["reputation_score_decimals"],
                     summary["client_count"],
-                    summary["observation_block"],
-                    summary["observation_timestamp"],
                 ),
             )
 
@@ -1113,9 +1095,7 @@ def load_identity_records_from_db(agent_ids: Sequence[int]) -> Tuple[List[Dict[s
                     agent_wallet,
                     token_uri,
                     metadata_hosting_type,
-                    lifecycle_status,
-                    observation_block,
-                    observation_timestamp
+                    lifecycle_status
                 FROM agents_core
                 WHERE agent_id = ANY(%s)
                 """,
@@ -1136,8 +1116,6 @@ def load_identity_records_from_db(agent_ids: Sequence[int]) -> Tuple[List[Dict[s
                 "token_uri": row[6],
                 "metadata_hosting_type": row[7],
                 "lifecycle_status": row[8],
-                "observation_block": int(row[9]) if row[9] is not None else None,
-                "observation_timestamp": row[10],
             }
         )
     missing_ids = sorted(set(agent_ids) - {int(record["agent_id"]) for record in records})

@@ -161,7 +161,7 @@ After each run, always check FINAL_FAILED_ALL and rerun failed agents before pro
 ## Notes
 
 - Existing rows are intentionally refreshed, not preserved.
-- `agents_core.observation_block` is the canonical block-height field name used by the pipeline.
+- The pipeline reads chain state at a configured `observation_block`, but table schemas may not persist that field directly.
 - If historical calls fail again, the first thing to check is whether the archive RPC secret is valid and whether that provider really supports archive `eth_call` on Ethereum mainnet.
 
 ## Failure Handling & Rerun Strategy
