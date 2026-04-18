@@ -61,12 +61,12 @@ SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
 # -----------------------------
 # Manual rerun controls
 # -----------------------------
-RERUN_AGENT_IDS: List[int] = []
+RERUN_AGENT_IDS: List[int] = [2434]
 RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
 RERUN_ONLY = False
 
-RUN_IDENTITY = True
-RUN_METADATA = True
+RUN_IDENTITY = False
+RUN_METADATA = False
 RUN_REPUTATION = True
 
 
