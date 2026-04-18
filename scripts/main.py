@@ -63,7 +63,7 @@ SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
 # -----------------------------
 RERUN_AGENT_IDS: List[int] = [2434]
 RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
-RERUN_ONLY = False
+RERUN_ONLY = True
 
 RUN_IDENTITY = False
 RUN_METADATA = False
