@@ -61,15 +61,7 @@ SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
 # -----------------------------
 # Manual rerun controls
 # -----------------------------
-#RERUN_AGENT_IDS: List[int] = [2434]
-#RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
-#RERUN_ONLY = False
-
-#RUN_IDENTITY = False
-#RUN_METADATA = False
-#RUN_REPUTATION = False
-
-RERUN_AGENT_IDS： List[int] = [
+RERUN_AGENT_IDS: List[int] = [
   3200,3201,3202,3203,3204,3205,3206,3207,3208,3209,
   3210,3211,3212,3213,3214,3215,3216,3217,3218,3219,
   3220,3221,3222,3223,3224,3225,3226,3227,3228,3229,
@@ -80,14 +72,14 @@ RERUN_AGENT_IDS： List[int] = [
   3270,3271,3272,3273,3274,3275,3276,3277,3278,3279,
   3280,3281,3282,3283,3284,3285,3286,3287,3288,3289,
   3290,3291,3292,3293,3294,3295,3296,3297,3298,3299,
-  9751,9753,9757
-]
+  9751,9753,9757]
 RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
 RERUN_ONLY = True
 
 RUN_IDENTITY = False
 RUN_METADATA = True
 RUN_REPUTATION = False
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
