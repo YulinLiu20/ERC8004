@@ -110,6 +110,7 @@ RPC_NEXT_ALLOWED_AT = 0.0
 
 TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)")
 ZERO_TOPIC_BYTES32 = b"\x00" * 32
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
 def norm_addr(addr: Optional[str]) -> Optional[str]:
@@ -118,6 +119,11 @@ def norm_addr(addr: Optional[str]) -> Optional[str]:
 
 def norm_tx_hash(txh: Optional[str]) -> Optional[str]:
     return str(txh).lower() if txh else None
+
+
+def topic_to_address(topic) -> str:
+    topic_bytes = bytes(topic)
+    return f"0x{topic_bytes[-20:].hex()}".lower()
 
 
 def checksum(addr: str) -> str:
@@ -303,6 +309,120 @@ def fetch_identity_logs(start_block: int, end_block: int) -> List[dict]:
             "topics": [TRANSFER_TOPIC],
         }
     )
+
+
+def fetch_transfer_logs(start_block: int, end_block: int) -> List[dict]:
+    return w3.eth.get_logs(
+        {
+            "fromBlock": int(start_block),
+            "toBlock": int(end_block),
+            "address": checksum(IDENTITY_REGISTRY),
+            "topics": [TRANSFER_TOPIC],
+        }
+    )
+
+
+def collect_transfer_history(config: PipelineConfig) -> List[Tuple]:
+    current_block = config.start_block
+    current_window = config.scan_block_window
+    rows: List[Tuple] = []
+
+    print(
+        f"[transfer_history] scanning from block {config.start_block} "
+        f"to observation_block {config.observation_block}"
+    )
+
+    while current_block <= config.observation_block:
+        chunk_end = min(current_block + current_window - 1, config.observation_block)
+        try:
+            logs = fetch_transfer_logs(current_block, chunk_end)
+        except Exception as exc:
+            if current_window > 1:
+                next_window = max(1, current_window // 2)
+                print(
+                    f"[transfer_history] get_logs failed for blocks "
+                    f"{current_block}-{chunk_end}: {repr(exc)}. "
+                    f"Retrying with smaller window {next_window}."
+                )
+                current_window = next_window
+                continue
+            raise
+
+        chunk_rows = 0
+        for log in logs:
+            topics = log.get("topics", [])
+            if len(topics) != 4 or topics[0] != TRANSFER_TOPIC:
+                continue
+
+            agent_id = int.from_bytes(bytes(topics[3]), byteorder="big")
+            from_address = topic_to_address(topics[1])
+            to_address = topic_to_address(topics[2])
+
+            if from_address == ZERO_ADDRESS:
+                transfer_type = "mint"
+            elif to_address == ZERO_ADDRESS:
+                transfer_type = "burn"
+            else:
+                transfer_type = "transfer"
+
+            rows.append(
+                (
+                    agent_id,
+                    from_address,
+                    to_address,
+                    int(log["blockNumber"]),
+                    norm_tx_hash(log["transactionHash"].hex()),
+                    int(log["logIndex"]),
+                    transfer_type,
+                )
+            )
+            chunk_rows += 1
+
+        print(
+            f"[transfer_history] blocks {current_block}-{chunk_end} "
+            f"rows_collected={chunk_rows} total_rows={len(rows)} window={current_window}"
+        )
+
+        if current_window < config.scan_block_window:
+            current_window = min(config.scan_block_window, current_window * 2)
+        current_block = chunk_end + 1
+
+    return rows
+
+
+def upsert_transfer_history(rows: Sequence[Tuple]) -> None:
+    if not rows:
+        return
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            execute_batch(
+                cur,
+                """
+                INSERT INTO transfer_history (
+                    agent_id,
+                    from_address,
+                    to_address,
+                    block_number,
+                    tx_hash,
+                    log_index,
+                    transfer_type
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (tx_hash, log_index) DO NOTHING
+                """,
+                list(rows),
+                page_size=500,
+            )
+
+
+def run_transfer_history_stage(config: PipelineConfig) -> Dict[str, int]:
+    rows = collect_transfer_history(config)
+    upsert_transfer_history(rows)
+    return {
+        "collected": len(rows),
+        "upsert_attempted": len(rows),
+    }
 
 
 def discover_target_agents(config: PipelineConfig) -> List[Dict[str, object]]:
@@ -1147,6 +1267,9 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("Rerun only:", config.rerun_only)
     print("Rerun agent ids:", list(config.rerun_agent_ids))
     print("Rerun-only stages:", list(config.rerun_only_stages))
+
+    transfer_stats = run_transfer_history_stage(config)
+    print(f"[transfer_history] stats: {transfer_stats}")
 
     failed_identity_agents: List[int] = []
     failed_metadata_agents: List[int] = []
