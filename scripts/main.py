@@ -1388,8 +1388,12 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("Pipeline completed.")
 
 
+# def main() -> None:
+#     run_pipeline(PipelineConfig())
+
 def main() -> None:
-    run_pipeline(PipelineConfig())
+    stats = run_transfer_history_stage(PipelineConfig())
+    print(stats)
 
 
 if __name__ == "__main__":
