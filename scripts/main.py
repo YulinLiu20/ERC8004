@@ -1,5 +1,9 @@
 import json
 import os
+import random
+import time
+import threading
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +12,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import psycopg2
 import requests
 from psycopg2.extras import execute_batch
+from requests import HTTPError
 from web3 import Web3
 
 
@@ -35,14 +40,34 @@ CONTRACT_SYMBOL = "AGENT"
 START_BLOCK = 24339925
 OBSERVATION_BLOCK = START_BLOCK + 500000
 
-TARGET_AGENT_ID_MIN = 0
-TARGET_AGENT_ID_MAX = 999
+TARGET_AGENT_ID_MIN = 1000
+TARGET_AGENT_ID_MAX = 1999
 TARGET_AGENT_COUNT = 1000
 
 SCAN_BLOCK_WINDOW = 500
-PIPELINE_BATCH_SIZE = 100
-MAX_WORKERS = 8
+PIPELINE_BATCH_SIZE = 50
+MAX_WORKERS = 4
+REPUTATION_MAX_WORKERS = 2
 HTTP_TIMEOUT = 20
+RPC_MAX_RETRIES = 6
+RPC_RETRY_BASE_DELAY_SECONDS = 0.5
+RPC_BACKOFF_JITTER_SECONDS = 0.25
+RPC_MAX_IN_FLIGHT = 2
+RPC_MIN_INTERVAL_SECONDS = 0.05
+FAIL_ON_INCOMPLETE_SNAPSHOT = True
+SECOND_PASS_RETRY_ENABLED = True
+SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
+
+# -----------------------------
+# Manual rerun controls
+# -----------------------------
+RERUN_AGENT_IDS: List[int] = []
+RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
+RERUN_ONLY = False
+
+RUN_IDENTITY = True
+RUN_METADATA = True
+RUN_REPUTATION = True
 
 
 @dataclass(frozen=True)
@@ -55,10 +80,28 @@ class PipelineConfig:
     scan_block_window: int = SCAN_BLOCK_WINDOW
     pipeline_batch_size: int = PIPELINE_BATCH_SIZE
     max_workers: int = MAX_WORKERS
+    reputation_max_workers: int = REPUTATION_MAX_WORKERS
     http_timeout: int = HTTP_TIMEOUT
+    rpc_max_retries: int = RPC_MAX_RETRIES
+    rpc_retry_base_delay_seconds: float = RPC_RETRY_BASE_DELAY_SECONDS
+    rpc_backoff_jitter_seconds: float = RPC_BACKOFF_JITTER_SECONDS
+    fail_on_incomplete_snapshot: bool = FAIL_ON_INCOMPLETE_SNAPSHOT
+    second_pass_retry_enabled: bool = SECOND_PASS_RETRY_ENABLED
+    second_pass_retry_delay_seconds: float = SECOND_PASS_RETRY_DELAY_SECONDS
+    rpc_max_in_flight: int = RPC_MAX_IN_FLIGHT
+    rpc_min_interval_seconds: float = RPC_MIN_INTERVAL_SECONDS
+    rerun_agent_ids: Tuple[int, ...] = tuple(RERUN_AGENT_IDS)
+    rerun_only_stages: Tuple[str, ...] = tuple(RERUN_ONLY_STAGES)
+    rerun_only: bool = RERUN_ONLY
+    run_identity: bool = RUN_IDENTITY
+    run_metadata: bool = RUN_METADATA
+    run_reputation: bool = RUN_REPUTATION
 
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
+RPC_SEMAPHORE = threading.BoundedSemaphore(max(1, RPC_MAX_IN_FLIGHT))
+RPC_THROTTLE_LOCK = threading.Lock()
+RPC_NEXT_ALLOWED_AT = 0.0
 
 
 # =========================================================
@@ -67,6 +110,7 @@ w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
 TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)")
 ZERO_TOPIC_BYTES32 = b"\x00" * 32
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
 def norm_addr(addr: Optional[str]) -> Optional[str]:
@@ -75,6 +119,11 @@ def norm_addr(addr: Optional[str]) -> Optional[str]:
 
 def norm_tx_hash(txh: Optional[str]) -> Optional[str]:
     return str(txh).lower() if txh else None
+
+
+def topic_to_address(topic) -> str:
+    topic_bytes = bytes(topic)
+    return f"0x{topic_bytes[-20:].hex()}".lower()
 
 
 def checksum(addr: str) -> str:
@@ -107,6 +156,25 @@ def resolve_token_uri(token_uri: Optional[str]) -> Optional[str]:
     return token_uri
 
 
+def parse_data_uri_json(url: str) -> Optional[Dict[str, object]]:
+    if not url.startswith("data:"):
+        return None
+
+    header, sep, payload = url.partition(",")
+    if not sep:
+        return None
+
+    header_lower = header.lower()
+    if "application/json" not in header_lower:
+        return None
+    if ";base64" not in header_lower:
+        return None
+
+    decoded_bytes = base64.b64decode(payload)
+    decoded_text = decoded_bytes.decode("utf-8")
+    return json.loads(decoded_text)
+
+
 def get_db_conn():
     return psycopg2.connect(NEON_DATABASE_URL)
 
@@ -114,6 +182,40 @@ def get_db_conn():
 def chunked(items: Sequence[object], size: int) -> Iterable[List[object]]:
     for index in range(0, len(items), size):
         yield list(items[index:index + size])
+
+
+def _is_retryable_rpc_exception(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError) and exc.response is not None:
+        return int(exc.response.status_code) in {429, 500, 502, 503, 504}
+    return False
+
+
+def rpc_call_with_retry(callable_fn, config: PipelineConfig, context: str):
+    global RPC_NEXT_ALLOWED_AT
+
+    attempts = max(1, int(config.rpc_max_retries))
+    delay_seconds = max(0.0, float(config.rpc_retry_base_delay_seconds))
+    jitter_seconds = max(0.0, float(config.rpc_backoff_jitter_seconds))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with RPC_SEMAPHORE:
+                with RPC_THROTTLE_LOCK:
+                    now = time.monotonic()
+                    wait_for = RPC_NEXT_ALLOWED_AT - now
+                    if wait_for > 0:
+                        time.sleep(wait_for)
+                    RPC_NEXT_ALLOWED_AT = time.monotonic() + max(0.0, config.rpc_min_interval_seconds)
+                return callable_fn()
+        except Exception as exc:
+            if attempt >= attempts or not _is_retryable_rpc_exception(exc):
+                raise
+            backoff = delay_seconds * (2 ** (attempt - 1)) + random.uniform(0.0, jitter_seconds)
+            print(
+                f"[rpc] {context} failed with retryable error on attempt "
+                f"{attempt}/{attempts}: {repr(exc)}. Sleeping {backoff:.2f}s."
+            )
+            time.sleep(backoff)
 
 
 # =========================================================
@@ -209,6 +311,120 @@ def fetch_identity_logs(start_block: int, end_block: int) -> List[dict]:
     )
 
 
+def fetch_transfer_logs(start_block: int, end_block: int) -> List[dict]:
+    return w3.eth.get_logs(
+        {
+            "fromBlock": int(start_block),
+            "toBlock": int(end_block),
+            "address": checksum(IDENTITY_REGISTRY),
+            "topics": [TRANSFER_TOPIC],
+        }
+    )
+
+
+def collect_transfer_history(config: PipelineConfig) -> List[Tuple]:
+    current_block = config.start_block
+    current_window = config.scan_block_window
+    rows: List[Tuple] = []
+
+    print(
+        f"[transfer_history] scanning from block {config.start_block} "
+        f"to observation_block {config.observation_block}"
+    )
+
+    while current_block <= config.observation_block:
+        chunk_end = min(current_block + current_window - 1, config.observation_block)
+        try:
+            logs = fetch_transfer_logs(current_block, chunk_end)
+        except Exception as exc:
+            if current_window > 1:
+                next_window = max(1, current_window // 2)
+                print(
+                    f"[transfer_history] get_logs failed for blocks "
+                    f"{current_block}-{chunk_end}: {repr(exc)}. "
+                    f"Retrying with smaller window {next_window}."
+                )
+                current_window = next_window
+                continue
+            raise
+
+        chunk_rows = 0
+        for log in logs:
+            topics = log.get("topics", [])
+            if len(topics) != 4 or topics[0] != TRANSFER_TOPIC:
+                continue
+
+            agent_id = int.from_bytes(bytes(topics[3]), byteorder="big")
+            from_address = topic_to_address(topics[1])
+            to_address = topic_to_address(topics[2])
+
+            if from_address == ZERO_ADDRESS:
+                transfer_type = "mint"
+            elif to_address == ZERO_ADDRESS:
+                transfer_type = "burn"
+            else:
+                transfer_type = "transfer"
+
+            rows.append(
+                (
+                    agent_id,
+                    from_address,
+                    to_address,
+                    int(log["blockNumber"]),
+                    norm_tx_hash(log["transactionHash"].hex()),
+                    int(log["logIndex"]),
+                    transfer_type,
+                )
+            )
+            chunk_rows += 1
+
+        print(
+            f"[transfer_history] blocks {current_block}-{chunk_end} "
+            f"rows_collected={chunk_rows} total_rows={len(rows)} window={current_window}"
+        )
+
+        if current_window < config.scan_block_window:
+            current_window = min(config.scan_block_window, current_window * 2)
+        current_block = chunk_end + 1
+
+    return rows
+
+
+def upsert_transfer_history(rows: Sequence[Tuple]) -> None:
+    if not rows:
+        return
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            execute_batch(
+                cur,
+                """
+                INSERT INTO transfer_history (
+                    agent_id,
+                    from_address,
+                    to_address,
+                    block_number,
+                    tx_hash,
+                    log_index,
+                    transfer_type
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (tx_hash, log_index) DO NOTHING
+                """,
+                list(rows),
+                page_size=500,
+            )
+
+
+def run_transfer_history_stage(config: PipelineConfig) -> Dict[str, int]:
+    rows = collect_transfer_history(config)
+    upsert_transfer_history(rows)
+    return {
+        "collected": len(rows),
+        "upsert_attempted": len(rows),
+    }
+
+
 def discover_target_agents(config: PipelineConfig) -> List[Dict[str, object]]:
     current_block = config.start_block
     discovered: Dict[int, Dict[str, object]] = {}
@@ -281,18 +497,34 @@ def discover_target_agents(config: PipelineConfig) -> List[Dict[str, object]]:
 # Identity
 # =========================================================
 
-def fetch_identity_state(agent_seed: Dict[str, object], observation_block: int) -> Dict[str, object]:
+def fetch_identity_state(
+    agent_seed: Dict[str, object], observation_block: int, config: PipelineConfig
+) -> Dict[str, object]:
     agent_id = int(agent_seed["agent_id"])
     mint_block = int(agent_seed["mint_block"])
     mint_tx_hash = norm_tx_hash(agent_seed["mint_tx_hash"])
 
     owner = norm_addr(
-        identity_contract.functions.ownerOf(agent_id).call(block_identifier=observation_block)
+        rpc_call_with_retry(
+            lambda: identity_contract.functions.ownerOf(agent_id).call(
+                block_identifier=observation_block
+            ),
+            config,
+            f"ownerOf(agent_id={agent_id})",
+        )
     )
-    token_uri = identity_contract.functions.tokenURI(agent_id).call(
-        block_identifier=observation_block
+    token_uri = rpc_call_with_retry(
+        lambda: identity_contract.functions.tokenURI(agent_id).call(
+            block_identifier=observation_block
+        ),
+        config,
+        f"tokenURI(agent_id={agent_id})",
     )
-    mint_block_data = w3.eth.get_block(mint_block)
+    mint_block_data = rpc_call_with_retry(
+        lambda: w3.eth.get_block(mint_block),
+        config,
+        f"get_block(mint_block={mint_block})",
+    )
 
     return {
         "agent_id": agent_id,
@@ -304,8 +536,6 @@ def fetch_identity_state(agent_seed: Dict[str, object], observation_block: int) 
         "token_uri": token_uri,
         "metadata_hosting_type": detect_hosting_type(token_uri),
         "lifecycle_status": "metadata_linked" if token_uri else "minted_only",
-        "observation_block": observation_block,
-        "observation_timestamp": datetime.now(timezone.utc),
     }
 
 
@@ -324,8 +554,6 @@ def upsert_agents_core(records: Sequence[Dict[str, object]]) -> None:
             record["token_uri"],
             record["metadata_hosting_type"],
             record["lifecycle_status"],
-            record["observation_block"],
-            record["observation_timestamp"],
         )
         for record in records
     ]
@@ -344,11 +572,9 @@ def upsert_agents_core(records: Sequence[Dict[str, object]]) -> None:
                     agent_wallet,
                     token_uri,
                     metadata_hosting_type,
-                    lifecycle_status,
-                    observation_block,
-                    observation_timestamp
+                    lifecycle_status
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (agent_id) DO UPDATE SET
                     mint_block = EXCLUDED.mint_block,
                     mint_timestamp = EXCLUDED.mint_timestamp,
@@ -357,16 +583,14 @@ def upsert_agents_core(records: Sequence[Dict[str, object]]) -> None:
                     agent_wallet = EXCLUDED.agent_wallet,
                     token_uri = EXCLUDED.token_uri,
                     metadata_hosting_type = EXCLUDED.metadata_hosting_type,
-                    lifecycle_status = EXCLUDED.lifecycle_status,
-                    observation_block = EXCLUDED.observation_block,
-                    observation_timestamp = EXCLUDED.observation_timestamp
+                    lifecycle_status = EXCLUDED.lifecycle_status
                 """,
                 rows,
                 page_size=500,
             )
 
 
-def upsert_mint_economics(records: Sequence[Dict[str, object]]) -> None:
+def upsert_mint_economics(records: Sequence[Dict[str, object]], config: PipelineConfig) -> None:
     if not records:
         return
 
@@ -378,9 +602,25 @@ def upsert_mint_economics(records: Sequence[Dict[str, object]]) -> None:
 
     rows = []
     for tx_hash, mint_block in unique_txs.items():
-        tx = w3.eth.get_transaction(tx_hash)
-        receipt = w3.eth.get_transaction_receipt(tx_hash)
-        block = w3.eth.get_block(mint_block)
+        try:
+            tx = rpc_call_with_retry(
+                lambda: w3.eth.get_transaction(tx_hash),
+                config,
+                f"get_transaction(tx_hash={tx_hash})",
+            )
+            receipt = rpc_call_with_retry(
+                lambda: w3.eth.get_transaction_receipt(tx_hash),
+                config,
+                f"get_transaction_receipt(tx_hash={tx_hash})",
+            )
+            block = rpc_call_with_retry(
+                lambda: w3.eth.get_block(mint_block),
+                config,
+                f"get_block(mint_block={mint_block})",
+            )
+        except Exception as exc:
+            print(f"[identity] failed mint economics tx_hash={tx_hash}: {repr(exc)}")
+            continue
 
         gas_used = int(receipt["gasUsed"])
         gas_price_value = tx.get("gasPrice")
@@ -441,10 +681,11 @@ def run_identity_stage(
     successes: List[Dict[str, object]] = []
     failed = 0
     skipped = 0
+    failed_seeds: List[Dict[str, object]] = []
 
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         future_map = {
-            executor.submit(fetch_identity_state, seed, config.observation_block): seed
+            executor.submit(fetch_identity_state, seed, config.observation_block, config): seed
             for seed in agent_seeds
         }
 
@@ -458,10 +699,34 @@ def run_identity_stage(
             except Exception as exc:
                 print(f"[identity] failed agent_id={agent_id}: {repr(exc)}")
                 failed += 1
+                failed_seeds.append(seed)
+
+    if config.second_pass_retry_enabled and failed_seeds:
+        print(f"[identity] second-pass retry for {len(failed_seeds)} failed agents (serial mode)")
+        recovered: List[Dict[str, object]] = []
+        still_failed: List[Dict[str, object]] = []
+
+        for seed in failed_seeds:
+            agent_id = int(seed["agent_id"])
+            try:
+                time.sleep(config.second_pass_retry_delay_seconds)
+                record = fetch_identity_state(seed, config.observation_block, config)
+                recovered.append(record)
+            except Exception as exc:
+                print(f"[identity] second-pass failed agent_id={agent_id}: {repr(exc)}")
+                still_failed.append(seed)
+
+        if recovered:
+            successes.extend(recovered)
+            failed -= len(recovered)
+            print(
+                f"[identity] second-pass recovered={len(recovered)} "
+                f"remaining_failed={len(still_failed)}"
+            )
 
     if successes:
         upsert_agents_core(successes)
-        upsert_mint_economics(successes)
+        upsert_mint_economics(successes, config)
 
     stats = {
         "success": len(successes),
@@ -502,23 +767,37 @@ def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -
     if not resolved_url:
         return None
 
-    response = requests.get(resolved_url, timeout=config.http_timeout)
-    response.raise_for_status()
-    metadata = response.json()
+    metadata_from_data_uri = parse_data_uri_json(resolved_url)
+    if metadata_from_data_uri is not None:
+        metadata = metadata_from_data_uri
+        content_type = "application/json"
+    else:
+        response = requests.get(resolved_url, timeout=config.http_timeout)
+        response.raise_for_status()
+        if response.text.strip() == "":
+            raise ValueError("metadata response body is empty")
+        try:
+            metadata = response.json()
+        except Exception as exc:
+            raise ValueError(f"metadata response is not valid JSON: {repr(exc)}") from exc
+        content_type = response.headers.get("Content-Type", "")
 
     services = metadata.get("services", [])
     supported_trust = metadata.get("supportedTrust", [])
     registrations = metadata.get("registrations", [])
+    x402_support = metadata.get("x402Support")
+    if x402_support is None:
+        x402_support = metadata.get("x402support")
 
     return {
         "agent_id": identity_record["agent_id"],
         "resolved_url": resolved_url,
-        "content_type": response.headers.get("Content-Type", ""),
+        "content_type": content_type,
         "metadata_updated_at": parse_unix_ts(metadata.get("updatedAt")),
         "name": metadata.get("name"),
         "description": metadata.get("description"),
         "image_url": metadata.get("image"),
-        "x402_support": metadata.get("x402support"),
+        "x402_support": x402_support,
         "active": metadata.get("active"),
         "service_count": len(services),
         "trust_count": len(supported_trust),
@@ -528,9 +807,7 @@ def fetch_metadata(identity_record: Dict[str, object], config: PipelineConfig) -
     }
 
 
-def write_metadata_record(record: Dict[str, object], _observation_block: int) -> None:
-    # token_uri is read at observation_block, but the fetched JSON content may be
-    # newer when the URI points to mutable HTTPS-hosted metadata.
+def write_metadata_record(record: Dict[str, object]) -> None:
     with get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -640,6 +917,7 @@ def run_metadata_stage(
     successful_records: Dict[int, Dict[str, object]] = {}
     failed = 0
     skipped = 0
+    failed_agent_ids: List[int] = []
 
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         future_map = {
@@ -657,16 +935,18 @@ def run_metadata_stage(
                     skipped += 1
                     continue
 
-                write_metadata_record(record, config.observation_block)
+                write_metadata_record(record)
                 successful_records[agent_id] = record
             except Exception as exc:
                 print(f"[metadata] failed agent_id={agent_id}: {repr(exc)}")
                 failed += 1
+                failed_agent_ids.append(agent_id)
 
     stats = {
         "success": len(successful_records),
         "failed": failed,
         "skipped": skipped,
+        "failed_agent_ids": failed_agent_ids,
     }
     return successful_records, stats
 
@@ -675,10 +955,18 @@ def run_metadata_stage(
 # Reputation
 # =========================================================
 
-def fetch_reputation(identity_record: Dict[str, object], observation_block: int) -> Dict[str, object]:
+def fetch_reputation(
+    identity_record: Dict[str, object], observation_block: int, config: PipelineConfig
+) -> Dict[str, object]:
     agent_id = int(identity_record["agent_id"])
 
-    clients = rep_contract.functions.getClients(agent_id).call(block_identifier=observation_block)
+    clients = rpc_call_with_retry(
+        lambda: rep_contract.functions.getClients(agent_id).call(
+            block_identifier=observation_block
+        ),
+        config,
+        f"getClients(agent_id={agent_id})",
+    )
     clients = [norm_addr(client) for client in clients]
 
     feedback_count_total = 0
@@ -687,12 +975,16 @@ def fetch_reputation(identity_record: Dict[str, object], observation_block: int)
 
     if clients:
         checksum_clients = [checksum(client) for client in clients if client]
-        count, raw_value, raw_decimals = rep_contract.functions.getSummary(
-            agent_id,
-            checksum_clients,
-            "",
-            "",
-        ).call(block_identifier=observation_block)
+        count, raw_value, raw_decimals = rpc_call_with_retry(
+            lambda: rep_contract.functions.getSummary(
+                agent_id,
+                checksum_clients,
+                "",
+                "",
+            ).call(block_identifier=observation_block),
+            config,
+            f"getSummary(agent_id={agent_id}, clients={len(checksum_clients)})",
+        )
 
         feedback_count_total = int(count)
         reputation_score_raw = int(raw_value)
@@ -705,17 +997,25 @@ def fetch_reputation(identity_record: Dict[str, object], observation_block: int)
 
         client_checksum = checksum(client)
         last_index = int(
-            rep_contract.functions.getLastIndex(agent_id, client_checksum).call(
-                block_identifier=observation_block
+            rpc_call_with_retry(
+                lambda: rep_contract.functions.getLastIndex(agent_id, client_checksum).call(
+                    block_identifier=observation_block
+                ),
+                config,
+                f"getLastIndex(agent_id={agent_id}, client={client})",
             )
         )
 
         for index in range(1, last_index + 1):
-            value_raw, value_decimals, tag1, tag2, revoked = rep_contract.functions.readFeedback(
-                agent_id,
-                client_checksum,
-                index,
-            ).call(block_identifier=observation_block)
+            value_raw, value_decimals, tag1, tag2, revoked = rpc_call_with_retry(
+                lambda: rep_contract.functions.readFeedback(
+                    agent_id,
+                    client_checksum,
+                    index,
+                ).call(block_identifier=observation_block),
+                config,
+                f"readFeedback(agent_id={agent_id}, client={client}, index={index})",
+            )
 
             feedback_rows.append(
                 (
@@ -737,8 +1037,6 @@ def fetch_reputation(identity_record: Dict[str, object], observation_block: int)
             "feedback_count_total": feedback_count_total,
             "reputation_score_raw": reputation_score_raw,
             "reputation_score_decimals": reputation_score_decimals,
-            "observation_block": observation_block,
-            "observation_timestamp": datetime.now(timezone.utc),
         },
         "feedback_rows": feedback_rows,
     }
@@ -754,18 +1052,14 @@ def write_reputation_record(summary: Dict[str, object], feedback_rows: Sequence[
                     feedback_count_total,
                     reputation_score_raw,
                     reputation_score_decimals,
-                    client_count,
-                    observation_block,
-                    observation_timestamp
+                    client_count
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s)
                 ON CONFLICT (agent_id) DO UPDATE SET
                     feedback_count_total = EXCLUDED.feedback_count_total,
                     reputation_score_raw = EXCLUDED.reputation_score_raw,
                     reputation_score_decimals = EXCLUDED.reputation_score_decimals,
-                    client_count = EXCLUDED.client_count,
-                    observation_block = EXCLUDED.observation_block,
-                    observation_timestamp = EXCLUDED.observation_timestamp
+                    client_count = EXCLUDED.client_count
                 """,
                 (
                     summary["agent_id"],
@@ -773,8 +1067,6 @@ def write_reputation_record(summary: Dict[str, object], feedback_rows: Sequence[
                     summary["reputation_score_raw"],
                     summary["reputation_score_decimals"],
                     summary["client_count"],
-                    summary["observation_block"],
-                    summary["observation_timestamp"],
                 ),
             )
 
@@ -810,10 +1102,12 @@ def run_reputation_stage(
     successful_records: Dict[int, Dict[str, object]] = {}
     failed = 0
     skipped = 0
+    failed_agent_ids: List[int] = []
+    failed_identity_records: List[Dict[str, object]] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
-            executor.submit(fetch_reputation, record, config.observation_block): record
+            executor.submit(fetch_reputation, record, config.observation_block, config): record
             for record in identity_records
         }
 
@@ -828,11 +1122,41 @@ def run_reputation_stage(
             except Exception as exc:
                 print(f"[reputation] failed agent_id={agent_id}: {repr(exc)}")
                 failed += 1
+                failed_agent_ids.append(agent_id)
+                failed_identity_records.append(identity_record)
+
+    if config.second_pass_retry_enabled and failed_identity_records:
+        print(
+            f"[reputation] second-pass retry for {len(failed_identity_records)} "
+            "failed agents (serial mode)"
+        )
+        recovered_agent_ids: List[int] = []
+
+        for identity_record in failed_identity_records:
+            agent_id = int(identity_record["agent_id"])
+            try:
+                time.sleep(config.second_pass_retry_delay_seconds)
+                result = fetch_reputation(identity_record, config.observation_block, config)
+                write_reputation_record(result["summary"], result["feedback_rows"])
+                successful_records[agent_id] = result
+                recovered_agent_ids.append(agent_id)
+            except Exception as exc:
+                print(f"[reputation] second-pass failed agent_id={agent_id}: {repr(exc)}")
+
+        if recovered_agent_ids:
+            recovered_set = set(recovered_agent_ids)
+            failed_agent_ids = [agent_id for agent_id in failed_agent_ids if agent_id not in recovered_set]
+            failed = len(failed_agent_ids)
+            print(
+                f"[reputation] second-pass recovered={len(recovered_set)} "
+                f"remaining_failed={failed}"
+            )
 
     stats = {
         "success": len(successful_records),
         "failed": failed,
         "skipped": skipped,
+        "failed_agent_ids": failed_agent_ids,
     }
     return successful_records, stats
 
@@ -840,6 +1164,82 @@ def run_reputation_stage(
 # =========================================================
 # Pipeline
 # =========================================================
+
+def load_identity_seeds_from_db(agent_ids: Sequence[int]) -> Tuple[List[Dict[str, object]], List[int]]:
+    if not agent_ids:
+        return [], []
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT agent_id, mint_block, mint_tx_hash
+                FROM agents_core
+                WHERE agent_id = ANY(%s)
+                """,
+                (list(agent_ids),),
+            )
+            rows = cur.fetchall()
+
+    seeds = []
+    found_ids = set()
+    for agent_id, mint_block, mint_tx_hash in rows:
+        found_ids.add(int(agent_id))
+        if mint_block is None or mint_tx_hash is None:
+            continue
+        seeds.append(
+            {
+                "agent_id": int(agent_id),
+                "mint_block": int(mint_block),
+                "mint_tx_hash": norm_tx_hash(mint_tx_hash),
+            }
+        )
+    missing_ids = sorted(set(agent_ids) - {int(seed["agent_id"]) for seed in seeds})
+    return sorted(seeds, key=lambda x: int(x["agent_id"])), missing_ids
+
+
+def load_identity_records_from_db(agent_ids: Sequence[int]) -> Tuple[List[Dict[str, object]], List[int]]:
+    if not agent_ids:
+        return [], []
+
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    agent_id,
+                    mint_block,
+                    mint_timestamp,
+                    mint_tx_hash,
+                    owner_wallet,
+                    agent_wallet,
+                    token_uri,
+                    metadata_hosting_type,
+                    lifecycle_status
+                FROM agents_core
+                WHERE agent_id = ANY(%s)
+                """,
+                (list(agent_ids),),
+            )
+            rows = cur.fetchall()
+
+    records = []
+    for row in rows:
+        records.append(
+            {
+                "agent_id": int(row[0]),
+                "mint_block": int(row[1]) if row[1] is not None else None,
+                "mint_timestamp": row[2],
+                "mint_tx_hash": norm_tx_hash(row[3]),
+                "owner_wallet": norm_addr(row[4]),
+                "agent_wallet": norm_addr(row[5]) if row[5] else None,
+                "token_uri": row[6],
+                "metadata_hosting_type": row[7],
+                "lifecycle_status": row[8],
+            }
+        )
+    missing_ids = sorted(set(agent_ids) - {int(record["agent_id"]) for record in records})
+    return sorted(records, key=lambda x: int(x["agent_id"])), missing_ids
 
 def print_batch_stats(stage_name: str, batch_number: int, stats: Dict[str, int]) -> None:
     print(
@@ -859,31 +1259,131 @@ def run_pipeline(config: PipelineConfig) -> None:
     )
     print("Target agent count:", config.target_agent_count)
     print("Pipeline batch size:", config.pipeline_batch_size)
+    print("Run stages:", {
+        "identity": config.run_identity,
+        "metadata": config.run_metadata,
+        "reputation": config.run_reputation,
+    })
+    print("Rerun only:", config.rerun_only)
+    print("Rerun agent ids:", list(config.rerun_agent_ids))
+    print("Rerun-only stages:", list(config.rerun_only_stages))
 
-    discovered_agents = discover_target_agents(config)
-    if not discovered_agents:
-        print("No agents discovered for the current configuration.")
-        return
+    failed_identity_agents: List[int] = []
+    failed_metadata_agents: List[int] = []
+    failed_reputation_agents: List[int] = []
 
-    for batch_number, agent_batch in enumerate(
-        chunked(discovered_agents, config.pipeline_batch_size),
-        start=1,
-    ):
-        batch_agent_ids = [int(agent["agent_id"]) for agent in agent_batch]
-        print(f"[batch {batch_number}] agent_ids={batch_agent_ids[0]}-{batch_agent_ids[-1]}")
+    if config.rerun_only and config.rerun_agent_ids:
+        target_ids = sorted(set(int(agent_id) for agent_id in config.rerun_agent_ids))
+        print(f"[rerun] running only specified agent ids: {target_ids}")
 
-        identity_records, identity_stats = run_identity_stage(agent_batch, config)
-        print_batch_stats("identity", batch_number, identity_stats)
+        if config.run_identity and "identity" in config.rerun_only_stages:
+            discovered_agents, missing_identity_seed_ids = load_identity_seeds_from_db(target_ids)
+            failed_identity_agents.extend(missing_identity_seed_ids)
+            identity_records, identity_stats = run_identity_stage(discovered_agents, config)
+            print_batch_stats("identity", 1, identity_stats)
+            succeeded_ids = {int(record["agent_id"]) for record in identity_records}
+            failed_identity_agents.extend(
+                [agent_id for agent_id in target_ids if agent_id not in succeeded_ids]
+            )
+        else:
+            identity_records, missing_identity_record_ids = load_identity_records_from_db(target_ids)
+            failed_identity_agents.extend(missing_identity_record_ids)
+            if missing_identity_record_ids:
+                print(
+                    "[rerun] missing prerequisite identity records in DB for agent_ids="
+                    f"{missing_identity_record_ids}"
+                )
+    else:
+        discovered_agents = discover_target_agents(config)
+        if not discovered_agents:
+            print("No agents discovered for the current configuration.")
+            return
 
-        if not identity_records:
-            print(f"[batch {batch_number}] no identity records succeeded, skipping downstream stages")
-            continue
+        identity_records = []
+        for batch_number, agent_batch in enumerate(
+            chunked(discovered_agents, config.pipeline_batch_size),
+            start=1,
+        ):
+            batch_agent_ids = [int(agent["agent_id"]) for agent in agent_batch]
+            print(f"[batch {batch_number}] agent_ids={batch_agent_ids[0]}-{batch_agent_ids[-1]}")
 
-        _, metadata_stats = run_metadata_stage(identity_records, config)
-        print_batch_stats("metadata", batch_number, metadata_stats)
+            if config.run_identity:
+                batch_identity_records, identity_stats = run_identity_stage(agent_batch, config)
+                print_batch_stats("identity", batch_number, identity_stats)
+                succeeded_ids = {int(record["agent_id"]) for record in batch_identity_records}
+                failed_identity_agents.extend(
+                    [agent_id for agent_id in batch_agent_ids if agent_id not in succeeded_ids]
+                )
+            else:
+                batch_identity_records, missing_ids = load_identity_records_from_db(batch_agent_ids)
+                failed_identity_agents.extend(missing_ids)
 
-        _, reputation_stats = run_reputation_stage(identity_records, config)
-        print_batch_stats("reputation", batch_number, reputation_stats)
+            if not batch_identity_records:
+                print(f"[batch {batch_number}] no identity records available, skipping downstream stages")
+                continue
+
+            if config.run_metadata:
+                _, metadata_stats = run_metadata_stage(batch_identity_records, config)
+                print_batch_stats("metadata", batch_number, metadata_stats)
+                failed_metadata_agents.extend(metadata_stats["failed_agent_ids"])
+
+            if config.run_reputation:
+                _, reputation_stats = run_reputation_stage(batch_identity_records, config)
+                print_batch_stats("reputation", batch_number, reputation_stats)
+                failed_reputation_agents.extend(reputation_stats["failed_agent_ids"])
+
+            identity_records.extend(batch_identity_records)
+
+    print("[transfer_history] starting full scan...")
+    transfer_stats = run_transfer_history_stage(config)
+    print(f"[transfer_history] done: {transfer_stats}")
+
+    if config.rerun_only and config.rerun_agent_ids:
+        target_ids = sorted(set(int(agent_id) for agent_id in config.rerun_agent_ids))
+
+        if config.run_metadata and "metadata" in config.rerun_only_stages and identity_records:
+            _, metadata_stats = run_metadata_stage(identity_records, config)
+            print_batch_stats("metadata", 1, metadata_stats)
+            failed_metadata_agents.extend(metadata_stats["failed_agent_ids"])
+        elif config.run_metadata and "metadata" in config.rerun_only_stages:
+            failed_metadata_agents.extend(target_ids)
+
+        if config.run_reputation and "reputation" in config.rerun_only_stages and identity_records:
+            _, reputation_stats = run_reputation_stage(identity_records, config)
+            print_batch_stats("reputation", 1, reputation_stats)
+            failed_reputation_agents.extend(reputation_stats["failed_agent_ids"])
+        elif config.run_reputation and "reputation" in config.rerun_only_stages:
+            failed_reputation_agents.extend(target_ids)
+
+    final_failed_identity = sorted(set(failed_identity_agents))
+    final_failed_metadata = sorted(set(failed_metadata_agents))
+    final_failed_reputation = sorted(set(failed_reputation_agents))
+    final_failed_all = sorted(
+        set(final_failed_identity + final_failed_metadata + final_failed_reputation)
+    )
+
+    print("FINAL_FAILED_IDENTITY =", final_failed_identity)
+    print("FINAL_FAILED_METADATA =", final_failed_metadata)
+    print("FINAL_FAILED_REPUTATION =", final_failed_reputation)
+    print("FINAL_FAILED_ALL =", final_failed_all)
+    print("RERUN_AGENT_IDS =", final_failed_all)
+
+    failed_agents_summary = {
+        "identity": final_failed_identity,
+        "metadata": final_failed_metadata,
+        "reputation": final_failed_reputation,
+        "all_failed": final_failed_all,
+    }
+    with open("failed_agents_last_run.json", "w", encoding="utf-8") as f:
+        json.dump(failed_agents_summary, f, ensure_ascii=False, indent=2)
+
+    if config.fail_on_incomplete_snapshot and final_failed_all:
+        raise RuntimeError(
+            "Pipeline finished with incomplete snapshot. "
+            f"identity_failed={len(final_failed_identity)} "
+            f"metadata_failed={len(final_failed_metadata)} "
+            f"reputation_failed={len(final_failed_reputation)}"
+        )
 
     print("Pipeline completed.")
 
