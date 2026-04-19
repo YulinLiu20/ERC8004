@@ -1268,9 +1268,6 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("Rerun agent ids:", list(config.rerun_agent_ids))
     print("Rerun-only stages:", list(config.rerun_only_stages))
 
-    transfer_stats = run_transfer_history_stage(config)
-    print(f"[transfer_history] stats: {transfer_stats}")
-
     failed_identity_agents: List[int] = []
     failed_metadata_agents: List[int] = []
     failed_reputation_agents: List[int] = []
@@ -1336,6 +1333,10 @@ def run_pipeline(config: PipelineConfig) -> None:
                 failed_reputation_agents.extend(reputation_stats["failed_agent_ids"])
 
             identity_records.extend(batch_identity_records)
+
+    print("[transfer_history] starting full scan...")
+    transfer_stats = run_transfer_history_stage(config)
+    print(f"[transfer_history] done: {transfer_stats}")
 
     if config.rerun_only and config.rerun_agent_ids:
         target_ids = sorted(set(int(agent_id) for agent_id in config.rerun_agent_ids))
