@@ -735,7 +735,7 @@ def run_identity_stage(
     skipped = 0
     failed_seeds: List[Dict[str, object]] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
             executor.submit(fetch_identity_state, seed, config.observation_block, config): seed
             for seed in agent_seeds
@@ -971,7 +971,7 @@ def run_metadata_stage(
     skipped = 0
     failed_agent_ids: List[int] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
             executor.submit(fetch_metadata, record, config): record
             for record in identity_records
@@ -1440,9 +1440,12 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("Pipeline completed.")
 
 
-TRANSFER_HISTORY_START_BLOCK = 24339925
-TRANSFER_HISTORY_END_BLOCK = 24439925
 
+
+# def main() -> None:
+#     run_pipeline(PipelineConfig())
+TRANSFER_HISTORY_START_BLOCK = 24390958
+TRANSFER_HISTORY_END_BLOCK = 24439925
 
 def main() -> None:
     stats = run_transfer_history_stage(
