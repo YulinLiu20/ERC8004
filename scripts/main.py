@@ -111,6 +111,7 @@ RPC_NEXT_ALLOWED_AT = 0.0
 TRANSFER_TOPIC = w3.keccak(text="Transfer(address,address,uint256)")
 ZERO_TOPIC_BYTES32 = b"\x00" * 32
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+TRANSFER_HISTORY_CHECKPOINT_FILE = "transfer_history_checkpoint.json"
 
 
 def norm_addr(addr: Optional[str]) -> Optional[str]:
@@ -322,72 +323,37 @@ def fetch_transfer_logs(start_block: int, end_block: int) -> List[dict]:
     )
 
 
-def collect_transfer_history(config: PipelineConfig) -> List[Tuple]:
-    current_block = config.start_block
-    current_window = config.scan_block_window
-    rows: List[Tuple] = []
+def load_transfer_history_checkpoint(config: PipelineConfig) -> Dict[str, int]:
+    if not os.path.exists(TRANSFER_HISTORY_CHECKPOINT_FILE):
+        return {
+            "last_scanned_block": config.start_block - 1,
+            "rows_written": 0,
+        }
+    try:
+        with open(TRANSFER_HISTORY_CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return {
+            "last_scanned_block": int(payload.get("last_scanned_block", config.start_block - 1)),
+            "rows_written": int(payload.get("rows_written", 0)),
+        }
+    except Exception:
+        return {
+            "last_scanned_block": config.start_block - 1,
+            "rows_written": 0,
+        }
 
-    print(
-        f"[transfer_history] scanning from block {config.start_block} "
-        f"to observation_block {config.observation_block}"
-    )
 
-    while current_block <= config.observation_block:
-        chunk_end = min(current_block + current_window - 1, config.observation_block)
-        try:
-            logs = fetch_transfer_logs(current_block, chunk_end)
-        except Exception as exc:
-            if current_window > 1:
-                next_window = max(1, current_window // 2)
-                print(
-                    f"[transfer_history] get_logs failed for blocks "
-                    f"{current_block}-{chunk_end}: {repr(exc)}. "
-                    f"Retrying with smaller window {next_window}."
-                )
-                current_window = next_window
-                continue
-            raise
-
-        chunk_rows = 0
-        for log in logs:
-            topics = log.get("topics", [])
-            if len(topics) != 4 or topics[0] != TRANSFER_TOPIC:
-                continue
-
-            agent_id = int.from_bytes(bytes(topics[3]), byteorder="big")
-            from_address = topic_to_address(topics[1])
-            to_address = topic_to_address(topics[2])
-
-            if from_address == ZERO_ADDRESS:
-                transfer_type = "mint"
-            elif to_address == ZERO_ADDRESS:
-                transfer_type = "burn"
-            else:
-                transfer_type = "transfer"
-
-            rows.append(
-                (
-                    agent_id,
-                    from_address,
-                    to_address,
-                    int(log["blockNumber"]),
-                    norm_tx_hash(log["transactionHash"].hex()),
-                    int(log["logIndex"]),
-                    transfer_type,
-                )
-            )
-            chunk_rows += 1
-
-        print(
-            f"[transfer_history] blocks {current_block}-{chunk_end} "
-            f"rows_collected={chunk_rows} total_rows={len(rows)} window={current_window}"
+def save_transfer_history_checkpoint(last_scanned_block: int, rows_written: int) -> None:
+    with open(TRANSFER_HISTORY_CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "last_scanned_block": int(last_scanned_block),
+                "rows_written": int(rows_written),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
         )
-
-        if current_window < config.scan_block_window:
-            current_window = min(config.scan_block_window, current_window * 2)
-        current_block = chunk_end + 1
-
-    return rows
 
 
 def upsert_transfer_history(rows: Sequence[Tuple]) -> None:
@@ -417,11 +383,83 @@ def upsert_transfer_history(rows: Sequence[Tuple]) -> None:
 
 
 def run_transfer_history_stage(config: PipelineConfig) -> Dict[str, int]:
-    rows = collect_transfer_history(config)
-    upsert_transfer_history(rows)
+    checkpoint = load_transfer_history_checkpoint(config)
+    current_block = max(config.start_block, checkpoint["last_scanned_block"] + 1)
+    current_window = config.scan_block_window
+    rows_written = checkpoint["rows_written"]
+    windows_processed = 0
+
+    print(
+        f"[transfer_history] scanning from block {current_block} "
+        f"to observation_block {config.observation_block} "
+        f"(checkpoint last_scanned_block={checkpoint['last_scanned_block']} rows_written={rows_written})"
+    )
+
+    while current_block <= config.observation_block:
+        chunk_end = min(current_block + current_window - 1, config.observation_block)
+        try:
+            logs = fetch_transfer_logs(current_block, chunk_end)
+        except Exception as exc:
+            if current_window > 1:
+                next_window = max(1, current_window // 2)
+                print(
+                    f"[transfer_history] get_logs failed for blocks "
+                    f"{current_block}-{chunk_end}: {repr(exc)}. "
+                    f"Retrying with smaller window {next_window}."
+                )
+                current_window = next_window
+                continue
+            raise
+
+        chunk_rows: List[Tuple] = []
+        for log in logs:
+            topics = log.get("topics", [])
+            if len(topics) != 4 or topics[0] != TRANSFER_TOPIC:
+                continue
+
+            agent_id = int.from_bytes(bytes(topics[3]), byteorder="big")
+            from_address = topic_to_address(topics[1])
+            to_address = topic_to_address(topics[2])
+
+            if from_address == ZERO_ADDRESS:
+                continue
+
+            transfer_type = "burn" if to_address == ZERO_ADDRESS else "transfer"
+            chunk_rows.append(
+                (
+                    agent_id,
+                    from_address,
+                    to_address,
+                    int(log["blockNumber"]),
+                    norm_tx_hash(log["transactionHash"].hex()),
+                    int(log["logIndex"]),
+                    transfer_type,
+                )
+            )
+
+        if chunk_rows:
+            upsert_transfer_history(chunk_rows)
+            rows_written += len(chunk_rows)
+
+        windows_processed += 1
+        print(
+            f"[transfer_history] blocks {current_block}-{chunk_end} "
+            f"rows_found={len(chunk_rows)} cumulative_rows_written={rows_written} window={current_window}"
+        )
+        save_transfer_history_checkpoint(chunk_end, rows_written)
+        print(
+            f"[transfer_history] checkpoint saved last_scanned_block={chunk_end} "
+            f"rows_written={rows_written}"
+        )
+
+        if current_window < config.scan_block_window:
+            current_window = min(config.scan_block_window, current_window * 2)
+        current_block = chunk_end + 1
+
     return {
-        "collected": len(rows),
-        "upsert_attempted": len(rows),
+        "rows_written": rows_written,
+        "last_scanned_block": min(config.observation_block, current_block - 1),
+        "windows_processed": windows_processed,
     }
 
 
