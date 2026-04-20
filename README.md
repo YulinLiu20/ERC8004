@@ -110,6 +110,17 @@ The script refreshes:
 - `agent_reputation_summary`
 - `agent_feedback_records`
 
+## Transfer History (Exploratory Auxiliary Table)
+
+`transfer_history` is treated as an exploratory auxiliary table under a sampled observation window.
+
+Current sampled window in `scripts/main.py`:
+
+- `TRANSFER_HISTORY_START_BLOCK = 24339925`
+- `TRANSFER_HISTORY_END_BLOCK = 24439925`
+
+This transfer-history run is intentionally scoped to the first 100k blocks of the larger backfill range.
+
 ## Batch Strategy
 
 The pipeline processes agents in batches of `PIPELINE_BATCH_SIZE`.
@@ -159,5 +170,5 @@ To move to the next range, update these values in `scripts/main.py`:
 ## Notes
 
 - Existing rows are intentionally refreshed, not preserved.
-- `agents_core.observation_block` is the canonical block-height field name used by the pipeline.
+- The pipeline reads chain state at a configured `observation_block`, but table schemas may not persist that field directly.
 - If historical calls fail again, the first thing to check is whether the archive RPC secret is valid and whether that provider really supports archive `eth_call` on Ethereum mainnet.
