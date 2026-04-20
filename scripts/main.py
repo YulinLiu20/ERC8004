@@ -367,12 +367,12 @@ def upsert_transfer_history(rows: Sequence[Tuple]) -> None:
                 """
                 INSERT INTO transfer_history (
                     agent_id,
-                    from_address,
-                    to_address,
-                    block_number,
+                    from_wallet,
+                    to_wallet,
                     tx_hash,
-                    log_index,
-                    transfer_type
+                    block_number,
+                    timestamp,
+                    log_index
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (tx_hash, log_index) DO NOTHING
@@ -412,6 +412,7 @@ def run_transfer_history_stage(config: PipelineConfig) -> Dict[str, int]:
             raise
 
         chunk_rows: List[Tuple] = []
+        block_timestamps: Dict[int, datetime] = {}
         for log in logs:
             topics = log.get("topics", [])
             if len(topics) != 4 or topics[0] != TRANSFER_TOPIC:
@@ -424,16 +425,27 @@ def run_transfer_history_stage(config: PipelineConfig) -> Dict[str, int]:
             if from_address == ZERO_ADDRESS:
                 continue
 
-            transfer_type = "burn" if to_address == ZERO_ADDRESS else "transfer"
+            block_number = int(log["blockNumber"])
+            if block_number not in block_timestamps:
+                block_data = rpc_call_with_retry(
+                    lambda: w3.eth.get_block(block_number),
+                    config,
+                    f"get_block(block_number={block_number}) for transfer_history",
+                )
+                block_timestamps[block_number] = datetime.fromtimestamp(
+                    int(block_data["timestamp"]),
+                    tz=timezone.utc,
+                )
+
             chunk_rows.append(
                 (
                     agent_id,
                     from_address,
                     to_address,
-                    int(log["blockNumber"]),
                     norm_tx_hash(log["transactionHash"].hex()),
+                    block_number,
+                    block_timestamps[block_number],
                     int(log["logIndex"]),
-                    transfer_type,
                 )
             )
 
