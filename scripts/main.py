@@ -419,6 +419,8 @@ def run_transfer_history_stage(config: PipelineConfig) -> Dict[str, int]:
                 continue
 
             agent_id = int.from_bytes(bytes(topics[3]), byteorder="big")
+            if agent_id < config.target_agent_id_min or agent_id > config.target_agent_id_max:
+                continue
             from_address = topic_to_address(topics[1])
             to_address = topic_to_address(topics[2])
 
