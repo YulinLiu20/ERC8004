@@ -126,7 +126,7 @@ Each stage prints:
 - `failed`
 - `skipped`
 
-Single-agent failures do not stop the whole batch.
+Single-agent failures do not stop the whole batch. Single-agent failures do not stop the whole batch. Failed agents are collected and can be rerun using the rerun mode described below.
 
 ## GitHub Actions Usage
 
@@ -156,8 +156,176 @@ To move to the next range, update these values in `scripts/main.py`:
 - `TARGET_AGENT_ID_MAX`
 - `TARGET_AGENT_COUNT`
 
+After each run, always check FINAL_FAILED_ALL and rerun failed agents before proceeding to the next range.
+
 ## Notes
 
 - Existing rows are intentionally refreshed, not preserved.
 - The pipeline reads chain state at a configured `observation_block`, but table schemas may not persist that field directly.
 - If historical calls fail again, the first thing to check is whether the archive RPC secret is valid and whether that provider really supports archive `eth_call` on Ethereum mainnet.
+
+## Failure Handling & Rerun Strategy
+
+Because the pipeline depends on external RPC providers and off-chain metadata endpoints, partial failures are expected in large runs (e.g. HTTP 429, invalid JSON, unreachable URLs).
+
+The pipeline is designed to:
+
+* continue processing even if individual agents fail
+* retry transient RPC failures automatically
+* record **final failed agent IDs per stage**
+
+### Final Failure Output
+
+At the end of each run, the script prints:
+
+```python
+FINAL_FAILED_IDENTITY = [...]
+FINAL_FAILED_METADATA = [...]
+FINAL_FAILED_REPUTATION = [...]
+FINAL_FAILED_ALL = [...]
+RERUN_AGENT_IDS = [...]
+```
+
+It also writes a file:
+
+```
+failed_agents_last_run.json
+```
+
+This file contains:
+
+```json
+{
+  "identity": [...],
+  "metadata": [...],
+  "reputation": [...],
+  "all_failed": [...]
+}
+```
+
+### Important Rule
+
+Only **final failures** are included.
+
+* Agents that failed initially but succeeded during second-pass retry are **NOT included**
+* Only agents that remain failed after all retries need to be rerun
+
+---
+
+### Manual Rerun Mode
+
+The pipeline supports rerunning only specific agents.
+
+In `scripts/main.py`:
+
+```python
+RERUN_AGENT_IDS = [2434, 2365, 2433]
+RERUN_ONLY = True
+```
+
+Optional stage control:
+
+```python
+RUN_IDENTITY = False
+RUN_METADATA = True
+RUN_REPUTATION = False
+```
+
+This allows targeted reruns such as:
+
+* only rerun metadata for failed agents
+* only rerun reputation for specific IDs
+
+---
+
+### Typical Workflow
+
+#### Step 1 — Run full pipeline
+
+Run the pipeline normally:
+
+```python
+RERUN_ONLY = False
+```
+
+---
+
+#### Step 2 — Collect failed agents
+
+After the run:
+
+* copy `RERUN_AGENT_IDS` from logs
+* or read `failed_agents_last_run.json`
+
+---
+
+#### Step 3 — Rerun only failed agents
+
+Paste into config:
+
+```python
+RERUN_AGENT_IDS = [...]
+RERUN_ONLY = True
+```
+
+Optionally restrict stages:
+
+```python
+RUN_METADATA = True
+RUN_REPUTATION = False
+```
+
+---
+
+#### Step 4 — Repeat if necessary
+
+Continue rerunning until:
+
+```python
+FINAL_FAILED_ALL = []
+```
+
+---
+
+### Common Failure Types
+
+#### 1. RPC Rate Limiting (HTTP 429)
+
+* caused by high concurrency or public RPC endpoints
+* usually resolved by retry or rerun
+
+#### 2. Metadata JSON Errors
+
+* empty response
+* invalid JSON
+* incorrect content-type
+
+These agents should be rerun, but some may be permanently invalid.
+
+#### 3. Data URI Metadata
+
+Some agents use:
+
+```
+data:application/json;base64,...
+```
+
+These are now supported and should not fail after fixes.
+
+#### 4. Missing Identity Records (rerun mode)
+
+If rerunning metadata/reputation without identity:
+
+* the script loads identity records from database
+* if missing, the agent will be marked as failed
+
+---
+
+### Best Practices
+
+* Always run with an archive RPC for historical consistency
+* Expect a small number of failures per batch
+* Use rerun mode instead of rerunning full ranges
+* Treat metadata failures as partially unreliable data sources
+
+---

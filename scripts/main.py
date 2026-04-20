@@ -40,9 +40,9 @@ CONTRACT_SYMBOL = "AGENT"
 START_BLOCK = 24339925
 OBSERVATION_BLOCK = START_BLOCK + 500000
 
-TARGET_AGENT_ID_MIN = 1000
-TARGET_AGENT_ID_MAX = 1999
-TARGET_AGENT_COUNT = 1000
+TARGET_AGENT_ID_MIN = 0
+TARGET_AGENT_ID_MAX = 9999
+TARGET_AGENT_COUNT = 10000
 
 SCAN_BLOCK_WINDOW = 500
 PIPELINE_BATCH_SIZE = 50
@@ -733,7 +733,7 @@ def run_identity_stage(
     skipped = 0
     failed_seeds: List[Dict[str, object]] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
             executor.submit(fetch_identity_state, seed, config.observation_block, config): seed
             for seed in agent_seeds
@@ -969,7 +969,7 @@ def run_metadata_stage(
     skipped = 0
     failed_agent_ids: List[int] = []
 
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=config.reputation_max_workers) as executor:
         future_map = {
             executor.submit(fetch_metadata, record, config): record
             for record in identity_records
@@ -1438,8 +1438,12 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("Pipeline completed.")
 
 
+# def main() -> None:
+#     run_pipeline(PipelineConfig())
+
 def main() -> None:
-    run_pipeline(PipelineConfig())
+    stats = run_transfer_history_stage(PipelineConfig())
+    print(stats)
 
 
 if __name__ == "__main__":
