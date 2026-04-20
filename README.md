@@ -110,6 +110,17 @@ The script refreshes:
 - `agent_reputation_summary`
 - `agent_feedback_records`
 
+## Transfer History (Exploratory Auxiliary Table)
+
+`transfer_history` is treated as an exploratory auxiliary table under a sampled observation window.
+
+Current sampled window in `scripts/main.py`:
+
+- `TRANSFER_HISTORY_START_BLOCK = 24339925`
+- `TRANSFER_HISTORY_END_BLOCK = 24439925`
+
+This transfer-history run is intentionally scoped to the first 100k blocks of the larger backfill range.
+
 ## Batch Strategy
 
 The pipeline processes agents in batches of `PIPELINE_BATCH_SIZE`.

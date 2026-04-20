@@ -1440,11 +1440,20 @@ def run_pipeline(config: PipelineConfig) -> None:
     print("Pipeline completed.")
 
 
+
+
 # def main() -> None:
 #     run_pipeline(PipelineConfig())
+TRANSFER_HISTORY_START_BLOCK = 24390958
+TRANSFER_HISTORY_END_BLOCK = 24439925
 
 def main() -> None:
-    stats = run_transfer_history_stage(PipelineConfig())
+    stats = run_transfer_history_stage(
+        PipelineConfig(
+            start_block=TRANSFER_HISTORY_START_BLOCK,
+            observation_block=TRANSFER_HISTORY_END_BLOCK,
+        )
+    )
     print(stats)
 
 
