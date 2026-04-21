@@ -59,7 +59,7 @@ SECOND_PASS_RETRY_ENABLED = True
 SECOND_PASS_RETRY_DELAY_SECONDS = 0.3
 
 # -----------------------------
-# Manual rerun controls
+# Manual rerun controls. this one is for you to rerun the program if certain agents were not fetched correctly or some data were missing.
 # -----------------------------
 RERUN_AGENT_IDS: List[int] = []
 RERUN_ONLY_STAGES = ["identity", "metadata", "reputation"]
@@ -1442,19 +1442,21 @@ def run_pipeline(config: PipelineConfig) -> None:
 
 
 
-# def main() -> None:
-#     run_pipeline(PipelineConfig())
-TRANSFER_HISTORY_START_BLOCK = 24390958
-TRANSFER_HISTORY_END_BLOCK = 24439925
-
 def main() -> None:
-    stats = run_transfer_history_stage(
-        PipelineConfig(
-            start_block=TRANSFER_HISTORY_START_BLOCK,
-            observation_block=TRANSFER_HISTORY_END_BLOCK,
-        )
-    )
-    print(stats)
+    run_pipeline(PipelineConfig())
+
+# the codes below are to fetch the transfer history of the ai agents. you can adjust the start or end block to choose the time window.
+# TRANSFER_HISTORY_START_BLOCK = 24390958
+# TRANSFER_HISTORY_END_BLOCK = 24439925
+
+# def main() -> None:
+#     stats = run_transfer_history_stage(
+#         PipelineConfig(
+#             start_block=TRANSFER_HISTORY_START_BLOCK,
+#             observation_block=TRANSFER_HISTORY_END_BLOCK,
+#         )
+#     )
+#     print(stats)
 
 
 if __name__ == "__main__":
