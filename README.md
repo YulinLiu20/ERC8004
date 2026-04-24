@@ -8,6 +8,8 @@ This repository backfills ERC-8004 agent data into Neon/Postgres in three fixed 
 
 The pipeline is designed around a single `observation_block`. For one run, all on-chain reads try to use the same block height so the dataset is internally consistent.
 
+The dataset is stored on Harvaard Dataverse https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/HJZW8Q
+
 ## Current Run Configuration
 
 The main configuration lives at the top of [scripts/main.py](C:\Users\yulin\OneDrive\Documents\GitHub\ERC8004\scripts\main.py:19).
