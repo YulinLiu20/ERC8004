@@ -93,4 +93,4 @@ Sci Data (2026). https://doi.org/10.7910/DVN/HJZW8Q
 
 ## License
 
-Code: MIT (or your chosen license — add a LICENSE file). Dataset: CC0 1.0 at Harvard Dataverse.
+Code: MIT. Dataset: CC0 1.0 at Harvard Dataverse.
