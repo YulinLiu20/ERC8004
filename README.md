@@ -1,344 +1,96 @@
-# ERC8004 Backfill Pipeline
+# ERC-8004 Agent Dataset — Collection Pipeline
 
-This repository backfills ERC-8004 agent data into Neon/Postgres in three fixed steps:
+This repository contains the code used to collect, process, and validate the dataset described in:
 
-1. `identity`
-2. `metadata`
-3. `reputation`
+> **A dataset of early blockchain-registered AI agents on Ethereum**
+> Yulin Liu, *Scientific Data* (2026, in press)
 
-The pipeline is designed around a single `observation_block`. For one run, all on-chain reads try to use the same block height so the dataset is internally consistent.
+The dataset itself (nine CSV files, one JSONL snapshot, and a data dictionary) is archived at Harvard Dataverse: <https://doi.org/10.7910/DVN/HJZW8Q> (CC0 1.0).
 
-The dataset is stored on Harvaard Dataverse https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/HJZW8Q
+## Overview
 
-## Current Run Configuration
+The pipeline backfills ERC-8004 agent data from Ethereum mainnet into a Postgres database in three fixed stages:
 
-The main configuration lives at the top of [scripts/main.py](C:\Users\yulin\OneDrive\Documents\GitHub\ERC8004\scripts\main.py:19).
+1. `identity` — owner, token URI, and mint transaction data for each agent
+2. `metadata` — resolution and parsing of token-linked off-chain metadata (`agent_metadata`, `agent_services`, `crosschain_registrations`)
+3. `reputation` — per-agent reputation summaries and individual feedback records (`agent_reputation_summary`, `agent_feedback_records`)
 
-Important values:
+All dynamic contract state is read at a single fixed `observation_block` via historical `eth_call`, so every agent is described at one consistent block height and results are exactly reproducible against any archive node.
 
-- `START_BLOCK = 24339925`
-- `OBSERVATION_BLOCK = START_BLOCK + 500000`
-- `TARGET_AGENT_ID_MIN = 0`
-- `TARGET_AGENT_ID_MAX = 9999`
-- `TARGET_AGENT_COUNT = 10000`
-- `PIPELINE_BATCH_SIZE = 100`
-- `MAX_WORKERS = 8`
+## Repository structure
 
-These values are intentionally kept in code so manual adjustments are easy before each GitHub Actions run.
+- `scripts/main.py` — main pipeline (discovery, identity, metadata, reputation) and run configuration
+- `.github/workflows/backfill.yml` — GitHub Actions workflow for manual runs
+- `requirements.txt` — Python dependencies (web3, psycopg2-binary, pandas, requests, python-dateutil)
 
-## Why Archive RPC Is Required
+## Configuration used for the released dataset
 
-The pipeline does not only scan logs. It also performs historical contract calls such as:
+Configuration lives at the top of `scripts/main.py`:
 
-- `ownerOf(agentId)` at `observation_block`
-- `tokenURI(agentId)` at `observation_block`
-- reputation contract reads at `observation_block`
+- `START_BLOCK = 24339925` (first mint, 2026-01-29)
+- `OBSERVATION_BLOCK = START_BLOCK + 500000` (= 24,839,925, the fixed observation block)
+- `TARGET_AGENT_ID_MIN = 0`, `TARGET_AGENT_ID_MAX = 9999`, `TARGET_AGENT_COUNT = 10000`
+- `PIPELINE_BATCH_SIZE = 100`, `MAX_WORKERS = 8`
 
-A normal public RPC may support `get_logs`, but still fail historical `eth_call` with errors like:
+Contract addresses (Ethereum mainnet):
 
-- `historical state ... is not available`
+- Identity registry: `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`
+- Reputation registry: `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63`
 
-Because of that, this pipeline must use an archive-capable Ethereum RPC whenever `observation_block` is in the past.
+## Requirements
 
-## Secrets And Environment Variables
+- Python 3.10+; install dependencies with `pip install -r requirements.txt`
+- An **archive-capable** Ethereum RPC endpoint. The pipeline performs historical `eth_call` (`ownerOf`, `tokenURI`, and reputation reads pinned to `observation_block`); ordinary public RPCs may support `eth_getLogs` but fail historical state queries with errors such as `historical state ... is not available`. Set it via the environment variable `ETHEREUM_ARCHIVE_RPC` (falls back to `https://ethereum-rpc.publicnode.com`, which is suitable only for quick local experiments).
+- A Postgres connection string via `NEON_DATABASE_URL`.
 
-GitHub Actions uses these secrets:
+For GitHub Actions runs, both values are provided as repository secrets (`NEON_DATABASE_URL`, `Ethereum_archive_RPC`).
 
-- `NEON_DATABASE_URL`
-- `Ethereum_archive_RPC`
-
-In the workflow, `Ethereum_archive_RPC` is mapped to the runtime environment variable `ETHEREUM_ARCHIVE_RPC`.
-
-In code:
-
-- `scripts/main.py` first reads `ETHEREUM_ARCHIVE_RPC`
-- if it is missing, it falls back to `https://ethereum-rpc.publicnode.com`
-
-The fallback is useful for quick local experiments, but it is not reliable for historical backfills because it may not support archive state.
-
-## Pipeline Behavior
+## Pipeline behavior
 
 ### Discovery
 
-The script scans identity contract `Transfer` logs from `START_BLOCK` up to `OBSERVATION_BLOCK`.
+The script scans identity-registry `Transfer` logs from `START_BLOCK` to `OBSERVATION_BLOCK` and keeps mint events (`from == 0x0…0`), filtered to the configured agent-ID range. Logs are requested in fixed-size chunks with adaptive chunk-size reduction on RPC errors, bounded concurrency, rate limiting, and exponential-backoff retries.
 
-It keeps only mint events:
+### Identity, metadata, reputation
 
-- `from == 0x0000000000000000000000000000000000000000`
+Each stage reads contract state at `observation_block`. Note one documented nuance: the token URI itself is read at the fixed block, but the content behind an HTTPS URI is mutable and may be newer than the block timestamp. The released dataset therefore includes a frozen snapshot of all retrieved metadata documents (`metadata_raw_snapshot.jsonl`) with SHA-256 hashes.
 
-Then it filters to the configured agent ID range and keeps the first `TARGET_AGENT_COUNT` agents in ascending `agent_id` order.
+Agents are processed in batches of `PIPELINE_BATCH_SIZE`; single-agent failures do not stop a batch. `agents_core` rows are upserted (`ON CONFLICT DO UPDATE`).
 
-Some RPC providers are stricter about `eth_getLogs` requests than others. The script now:
+### Transfer history
 
-- filters discovery logs to the `Transfer` topic immediately
-- automatically retries with a smaller block window if a provider rejects a larger log query
+`transfer_history` is an auxiliary table built from a scanned window of the first 100,000 blocks after the first mint (`24339925`–`24439925`), matching the window reported in the paper.
 
-### Identity
+## Failure handling and reruns
 
-For each agent in the batch, the script reads:
+Partial failures (HTTP 429, invalid or non-JSON metadata, unreachable URLs) are expected in large runs. Transient RPC failures are retried automatically, including a serial second-pass retry. At the end of each run the script prints final per-stage failure lists (`FINAL_FAILED_IDENTITY/METADATA/REPUTATION/ALL`, `RERUN_AGENT_IDS`) and writes `failed_agents_last_run.json`. Only agents that remain failed after all retries need rerunning.
 
-- current owner at `observation_block`
-- token URI at `observation_block`
-- mint block / mint tx information
-
-`agents_core` is updated with `ON CONFLICT DO UPDATE`, so existing rows are refreshed. This is important because:
-
-- previous runs may have used different `observation_block` values
-- `owner_wallet` can change after transfers
-
-### Metadata
-
-Metadata uses the `tokenURI` read at `observation_block`.
-
-Important nuance:
-
-- the token URI itself is read at the fixed block
-- the content behind that URI may still be a newer version if the URI points to mutable HTTPS content
-
-This is expected and documented in code comments.
-
-The script refreshes:
-
-- `agent_metadata`
-- `agent_services`
-- `crosschain_registrations`
-
-### Reputation
-
-Reputation reads are also executed at `observation_block`.
-
-The script refreshes:
-
-- `agent_reputation_summary`
-- `agent_feedback_records`
-
-## Transfer History (Exploratory Auxiliary Table)
-
-`transfer_history` is treated as an exploratory auxiliary table under a sampled observation window.
-
-Current sampled window in `scripts/main.py`:
-
-- `TRANSFER_HISTORY_START_BLOCK = 24339925`
-- `TRANSFER_HISTORY_END_BLOCK = 24439925`
-
-This transfer-history run is intentionally scoped to the first 100k blocks of the larger backfill range.
-
-## Batch Strategy
-
-The pipeline processes agents in batches of `PIPELINE_BATCH_SIZE`.
-
-For each batch, it runs:
-
-1. `identity`
-2. `metadata`
-3. `reputation`
-
-Each stage prints:
-
-- `success`
-- `failed`
-- `skipped`
-
-Single-agent failures do not stop the whole batch. Single-agent failures do not stop the whole batch. Failed agents are collected and can be rerun using the rerun mode described below.
-
-## GitHub Actions Usage
-
-Workflow file:
-
-- [.github/workflows/backfill.yml](C:\Users\yulin\OneDrive\Documents\GitHub\ERC8004\.github\workflows\backfill.yml:1)
-
-How to run:
-
-1. Open the GitHub Actions tab.
-2. Select `ERC8004 Manual Run`.
-3. Click `Run workflow`.
-
-There are no runtime form inputs. Change parameters directly in `scripts/main.py` before running.
-
-## Recommended Rollout Plan
-
-Current test plan:
-
-1. Run `agent_id 0-999`
-2. If successful, run `agent_id 1000-2999`
-3. If successful, run `agent_id 3000-10000`
-
-To move to the next range, update these values in `scripts/main.py`:
-
-- `TARGET_AGENT_ID_MIN`
-- `TARGET_AGENT_ID_MAX`
-- `TARGET_AGENT_COUNT`
-
-After each run, always check FINAL_FAILED_ALL and rerun failed agents before proceeding to the next range.
-
-## Notes
-
-- Existing rows are intentionally refreshed, not preserved.
-- The pipeline reads chain state at a configured `observation_block`, but table schemas may not persist that field directly.
-- If historical calls fail again, the first thing to check is whether the archive RPC secret is valid and whether that provider really supports archive `eth_call` on Ethereum mainnet.
-
-## Failure Handling & Rerun Strategy
-
-Because the pipeline depends on external RPC providers and off-chain metadata endpoints, partial failures are expected in large runs (e.g. HTTP 429, invalid JSON, unreachable URLs).
-
-The pipeline is designed to:
-
-* continue processing even if individual agents fail
-* retry transient RPC failures automatically
-* record **final failed agent IDs per stage**
-
-### Final Failure Output
-
-At the end of each run, the script prints:
+To rerun specific agents, set in `scripts/main.py`:
 
 ```python
-FINAL_FAILED_IDENTITY = [...]
-FINAL_FAILED_METADATA = [...]
-FINAL_FAILED_REPUTATION = [...]
-FINAL_FAILED_ALL = [...]
 RERUN_AGENT_IDS = [...]
-```
-
-It also writes a file:
-
-```
-failed_agents_last_run.json
-```
-
-This file contains:
-
-```json
-{
-  "identity": [...],
-  "metadata": [...],
-  "reputation": [...],
-  "all_failed": [...]
-}
-```
-
-### Important Rule
-
-Only **final failures** are included.
-
-* Agents that failed initially but succeeded during second-pass retry are **NOT included**
-* Only agents that remain failed after all retries need to be rerun
-
----
-
-### Manual Rerun Mode
-
-The pipeline supports rerunning only specific agents.
-
-In `scripts/main.py`:
-
-```python
-RERUN_AGENT_IDS = [2434, 2365, 2433]
 RERUN_ONLY = True
-```
-
-Optional stage control:
-
-```python
+# optional stage control:
 RUN_IDENTITY = False
 RUN_METADATA = True
 RUN_REPUTATION = False
 ```
 
-This allows targeted reruns such as:
+## Running via GitHub Actions
 
-* only rerun metadata for failed agents
-* only rerun reputation for specific IDs
+1. Open the **Actions** tab and select `ERC8004 Manual Run`.
+2. Click **Run workflow**. There are no runtime form inputs; parameters are edited directly in `scripts/main.py` before running.
 
----
+## Citation
 
-### Typical Workflow
-
-#### Step 1 — Run full pipeline
-
-Run the pipeline normally:
-
-```python
-RERUN_ONLY = False
-```
-
----
-
-#### Step 2 — Collect failed agents
-
-After the run:
-
-* copy `RERUN_AGENT_IDS` from logs
-* or read `failed_agents_last_run.json`
-
----
-
-#### Step 3 — Rerun only failed agents
-
-Paste into config:
-
-```python
-RERUN_AGENT_IDS = [...]
-RERUN_ONLY = True
-```
-
-Optionally restrict stages:
-
-```python
-RUN_METADATA = True
-RUN_REPUTATION = False
-```
-
----
-
-#### Step 4 — Repeat if necessary
-
-Continue rerunning until:
-
-```python
-FINAL_FAILED_ALL = []
-```
-
----
-
-### Common Failure Types
-
-#### 1. RPC Rate Limiting (HTTP 429)
-
-* caused by high concurrency or public RPC endpoints
-* usually resolved by retry or rerun
-
-#### 2. Metadata JSON Errors
-
-* empty response
-* invalid JSON
-* incorrect content-type
-
-These agents should be rerun, but some may be permanently invalid.
-
-#### 3. Data URI Metadata
-
-Some agents use:
+If you use this dataset or code, please cite:
 
 ```
-data:application/json;base64,...
+Liu, Y. A dataset of early blockchain-registered AI agents on Ethereum.
+Sci Data (2026). https://doi.org/10.7910/DVN/HJZW8Q
 ```
 
-These are now supported and should not fail after fixes.
 
-#### 4. Missing Identity Records (rerun mode)
+## License
 
-If rerunning metadata/reputation without identity:
-
-* the script loads identity records from database
-* if missing, the agent will be marked as failed
-
----
-
-### Best Practices
-
-* Always run with an archive RPC for historical consistency
-* Expect a small number of failures per batch
-* Use rerun mode instead of rerunning full ranges
-* Treat metadata failures as partially unreliable data sources
-
----
+Code: MIT (or your chosen license — add a LICENSE file). Dataset: CC0 1.0 at Harvard Dataverse.
